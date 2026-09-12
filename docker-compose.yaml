@@ -1,0 +1,23 @@
+services:
+  renamebot:
+    build: .
+    # Keep the Docker container name aligned with COMMAND_POSTFIX in .env.
+    # Example: COMMAND_POSTFIX=2 -> renamerbot2
+    container_name: renamerbot${COMMAND_POSTFIX:-}
+    restart: unless-stopped
+    mem_limit: 950m
+    env_file:
+      - .env
+    volumes:
+      # Keep runtime files outside the Git checkout.  src/bin is ignored by
+      # Git, so a deployment cleanup can otherwise remove it mid-transfer.
+      - renamer_data:/app/src/bin
+      - ./encode_bot.session:/app/encode_bot.session
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  renamer_data:

@@ -1,0 +1,94 @@
+{
+  "name": "telegram-renamer-bot",
+  "description": "Telegram's best Video Renamer Bot",
+  "logo": "https://telegra.ph/file/0e369e097843b0dc4b771.jpg",
+  "keywords": [
+    "telegram",
+    "best",
+    "video",
+    "Renamer",
+    "bot"
+  ],
+  "env": {
+    "OWNER_IDS": {
+      "description": "Bootstrap owner IDs (comma-separated). They can manage MongoDB-backed admins and restart the bot.",
+      "value": ""
+    },
+    "MONGO_URI": {
+      "description": "MongoDB connection URI used to store administrators and persistent rename-task checkpoints",
+      "value": "",
+      "required": true
+    },
+    "MONGO_DB_NAME": {
+      "description": "MongoDB database for this bot instance. Use a different name for every bot token sharing a cluster.",
+      "value": "renamer_bot",
+      "required": false
+    },
+    "SESSION_STRING": {
+      "description": "Optional Telegram Premium user-session string for downloads above 2 GiB. Leave empty to use normal bot downloads.",
+      "value": "",
+      "required": false
+    },
+    "ALLOWED_GROUP_IDS": {
+      "description": "Keep this as your Group chat ID where you will add the bot",
+      "value": "",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "Your bot token, as a string. Get this from @BotFather",
+      "value": "",
+      "required": true
+    },
+    "API_ID": {
+      "description": "Get this value from https://my.telegram.org",
+      "value": "",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Get this value from https://my.telegram.org",
+      "value": "",
+      "required": true
+    },
+    "DC": {
+      "description": "Optional comma-separated Telegram data centers (1-5) to allow; leave blank to allow all.",
+      "value": "",
+      "required": false
+    },
+    "COMMAND_POSTFIX": {
+      "description": "Numeric suffix appended to every command; use 0 for no suffix, 2 for /rename2, etc.",
+      "value": "0",
+      "required": false
+    },
+    "DUMP_CHAT_ID": {
+      "description": "Optional Telegram dump chat used by the Premium user session for files above 2 GiB. Use a numeric chat ID, public username, or invite link.",
+      "value": "",
+      "required": false
+    },
+    "BOT_DUMP_CHAT_ID": {
+      "description": "Bot-side dump chat for archived uploads. Use a numeric -100... ID or public @username; private invite URLs are not supported for the bot.",
+      "value": "",
+      "required": true
+    },
+    "GL_LIMIT": {
+      "description": "Global maximum number of complete rename jobs admitted to the pipeline.",
+      "value": "4",
+      "required": false
+    },
+    "DL_LIMIT": {
+      "description": "Maximum number of downloads running concurrently.",
+      "value": "4",
+      "required": false
+    },
+    "UL_LIMIT": {
+      "description": "Maximum number of uploads running concurrently.",
+      "value": "1",
+      "required": false
+    },
+    "WM_LIMIT": {
+      "description": "Maximum number of watermark processing jobs running concurrently.",
+      "value": "1",
+      "required": false
+    }
+  },
+  "stack": "container"
+}

@@ -1,0 +1,23 @@
+# Plain `pyrogram` from PyPI (v2.0.106) hasn't been meaningfully updated
+# since 2023 and uploads/downloads one chunk at a time over a single
+# connection per file — this is the main reason a Premium session's raw
+# upload throughput can sit around 1-2 MB/s regardless of concurrency
+# settings. kurigram is a maintained, drop-in-compatible fork (still
+# `import pyrogram` in code) with real parallel part transfer, which is
+# usually the single biggest lever for single-file transfer speed. If you
+# need to stay on stock pyrogram for any reason, swap this line back.
+kurigram
+tgcrypto
+python-dotenv
+FFmpeg-python
+pydantic
+psutil
+humanize
+aiofiles
+aioshutil
+aiohttp
+telegraph
+httpx
+fonttools
+pymediainfo
+motor
