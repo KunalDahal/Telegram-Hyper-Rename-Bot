@@ -10,13 +10,6 @@ MAX_DOWNLOAD_ATTEMPTS = 3
 
 
 class Downloader:
-    """Thin task-level adapter around HyperTGDownloader.
-
-    HyperTG owns the actual Telegram download, parallel chunk workers,
-    temporary part storage, final assembly, retries, and exact-size checks.
-    This class only resolves the staged/source message and reports progress
-    back to TaskQueue.
-    """
 
     def __init__(self, temp_base: str, task_queue=None, task_id=None, helper_bots=None, helper_loads=None):
         self.temp_base = temp_base
@@ -70,8 +63,6 @@ class Downloader:
             if not self.helper_bots:
                 raise RuntimeError("HyperTG helper bots are not configured")
 
-            # HyperTG owns the complete download lifecycle and final file path.
-            # No external packet staging/combining is performed here.
             hyper_downloader = HyperTGDownloader(
                 self.helper_bots,
                 self.helper_loads,

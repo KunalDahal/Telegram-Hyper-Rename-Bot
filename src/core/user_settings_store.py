@@ -1,4 +1,3 @@
-"""Synchronous MongoDB persistence for per-user rename settings and assets."""
 
 from __future__ import annotations
 
@@ -14,11 +13,10 @@ from pymongo.errors import PyMongoError
 
 
 class UserSettingsStoreError(RuntimeError):
-    """Raised when user settings cannot be read from or written to MongoDB."""
+    pass
 
 
 class UserSettingsStore:
-    """Stores settings documents and user thumbnail/font assets in one database."""
 
     def __init__(self, mongo_uri: str, database_name: str):
         self._client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5_000)
@@ -57,7 +55,6 @@ class UserSettingsStore:
             raise UserSettingsStoreError("Unable to save user settings to MongoDB.") from exc
 
     def upload_asset(self, user_id: int, kind: str, path: str, previous_id: str = "") -> str:
-        """Upload an asset and remove its prior GridFS version when possible."""
         try:
             with open(path, "rb") as source:
                 asset_id = self._assets.upload_from_stream(
@@ -88,7 +85,6 @@ class UserSettingsStore:
         try:
             self._assets.delete(ObjectId(asset_id))
         except (PyMongoError, ValueError):
-            # Missing or malformed historic asset IDs should not block settings changes.
             pass
 
     def close(self) -> None:

@@ -1,10 +1,17 @@
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 import os
+from html import escape
 from pyrogram.enums import ParseMode
 from src.utils.commands import command_filter, chat_scope_filter
+from src.core.user_setting import DEFAULT_CAPTION_TEMPLATE
+
+CAPTION_PLACEHOLDER = "{filename}"
+_CAPTION_PREVIEW_NAME = "Sample.Movie.Name.S01E01.mkv"
 
 _settings_owner: dict[tuple[int, int], int] = {}
+
+SETTINGS_IMAGE_URL = "https://i.ibb.co/RpZxdJwG/9a58b8252599bc747a0e0c7c6aa7c8b5.jpg"
 
 METADATA_FIELDS = [
     ("title_all", "Title All", "Send the title to apply to general, video, audio, and subtitle metadata."),
@@ -31,59 +38,50 @@ def build_settings_text(
     username,
     user_id,
     settings,
-    page: int = 0,
-    split_limit_gib: int = 2,
+    split_limit_gib: float = 1.95,
 ):
-    has_thumb  = bool(settings.get("thumbnail_path") and os.path.exists(settings.get("thumbnail_path", "")))
-    send_type  = "Media" if settings.get("send_type") == "media" else "Document"
-    auto_thumb = "On" if settings.get("auto_detect_thumb", False) else "Off"
-    meta       = settings.get("metadata", {})
+    has_thumb = bool(settings.get("thumbnail_path") and os.path.exists(settings.get("thumbnail_path", "")))
+    send_type = "Media" if settings.get("send_type") == "media" else "Document"
+    meta      = settings.get("metadata", {})
+    meta_set  = any(meta.get(key) for key, _, _ in METADATA_FIELDS)
 
     wm      = settings.get("watermark", {})
     wm_on   = wm.get("enabled", False)
-    wm_summary = "<u>On</u>" if wm_on else "<i>Off</i>"
 
     ep = settings.get("default_start_episode", 1)
 
-    thumb_status = "<u>Set</u>" if has_thumb else "<i>Not set</i>"
+    cap_disabled = settings.get("caption_disabled", False)
+    cap_custom   = settings.get("custom_caption", "")
 
-    page0 = (
-        "<b>Settings</b>  <code>(1 / 2)</code>\n\n"
-        f"<b>User:</b> {name}  <code>(@{username or 'N/A'})</code>\n"
-        f"<b>ID:</b> <code>{user_id}</code>\n\n"
-        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+    thumb_status = "<u>Set</u>"     if has_thumb    else "<i>Unset</i>"
+    meta_status  = "<u>Set</u>"     if meta_set     else "<i>Unset</i>"
+    wm_status    = "<u>Set</u>"     if wm_on        else "<i>Unset</i>"
+    if cap_disabled:
+        cap_status = "<i>Disabled</i>"
+    elif cap_custom:
+        cap_status = "<u>Custom</u>"
+    else:
+        cap_status = "<i>Default</i>"
+
+    display_name = escape(name) or "Unknown"
+    display_user = f"@{escape(username)}" if username else "N/A"
+
+    return (
+        "<b>▸ Welcome to Settings</b>\n"
+        "────────────────\n\n"
+        f"<b>Split Size:</b>  <code>{split_limit_gib}GB</code>\n"
+        f"<b>User:</b>  {display_name}  <code>{display_user}</code>  <code>{user_id}</code>\n\n"
         f"<b>Send Type:</b>  <code>{send_type}</code>\n"
+        f"<b>Start Episode:</b>  <code>{ep}</code>\n"
         f"<b>Thumbnail:</b>  {thumb_status}\n"
-        f"<b>Auto Detect Thumb:</b>  <code>{auto_thumb}</code>\n"
-        f"<b>Auto Split Size:</b>  <code>{split_limit_gib} GiB</code>"
+        f"<b>Metadata:</b>  {meta_status}\n"
+        f"<b>Watermark:</b>  {wm_status}\n"
+        f"<b>Caption:</b>  {cap_status}"
     )
 
-    metadata_lines = "\n".join(
-        f"{label:<18}:  <code>{meta.get(key) or '-'}</code>"
-        for key, label, _ in METADATA_FIELDS
-    )
 
-    page1 = (
-        "<b>Settings</b>  <code>(2 / 2)</code>\n\n"
-        "------------------\n"
-        "<b>Metadata:</b>\n\n"
-        f"{metadata_lines}\n"
-        "------------------\n"
-        f"<b>Watermark:</b> {wm_summary}\n"
-        "------------------\n"
-        f"<b>Start Episode: <code>{ep}</code></b>\n"
-        "------------------\n"
-    )
-
-    pages = [page0, page1]
-    total = len(pages)
-    idx   = max(0, min(page, total - 1))
-    return pages[idx], total
-
-
-def _split_limit_gib(premium_session_available: bool = False) -> int:
-    """Show the bot's actual automatic upload/download capability."""
-    return 4 if premium_session_available else 2
+def _split_limit_gib(premium_session_available: bool = False) -> float:
+    return 3.95 if premium_session_available else 1.95
 
 def _secs_to_mmss(seconds: int) -> str:
     seconds = max(0, int(seconds))
@@ -137,40 +135,32 @@ def build_watermark_text(wm: dict, subtitle: str = "") -> str:
         f"Padding   : <code>{padding}%</code>\n"
         f"Timing    : {timing_str}\n"
         f"Position  : {position}\n\n"
-        "<i>If nothing is available after the selected priority, no thumbnail is applied.</i>"
+        "<blockquote><i>If nothing is available after the selected priority, no thumbnail is applied.</i></blockquote>"
     )
 
-def build_main_keyboard(page: int = 0, total_pages: int = 2):
-    nav = []
-    if page == 0:
-        action_rows = [
-            [InlineKeyboardButton("Send Type",  callback_data="set_send_type"),
-             InlineKeyboardButton("Thumbnail",  callback_data="set_thumbnail")],
-        ]
-    else:
-        action_rows = [
-            [InlineKeyboardButton("Metadata",      callback_data="set_metadata"),
-             InlineKeyboardButton("Watermark",     callback_data="set_watermark")],
-            [InlineKeyboardButton("Start Episode", callback_data="set_start_episode")],
-        ]
+def build_main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Send Type",     callback_data="set_send_type"),
+         InlineKeyboardButton("Thumbnail",     callback_data="set_thumbnail")],
+        [InlineKeyboardButton("Metadata",      callback_data="set_metadata"),
+         InlineKeyboardButton("Start Episode", callback_data="set_start_episode")],
+        [InlineKeyboardButton("Watermark",     callback_data="set_watermark"),
+         InlineKeyboardButton("Caption",       callback_data="set_caption")],
+        [InlineKeyboardButton("Reset All",     callback_data="reset_settings"),
+         InlineKeyboardButton("Close",         callback_data="close_menu")],
+    ])
 
-    if page > 0:
-        nav.append(InlineKeyboardButton("<", callback_data=f"settings_page:{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1} / {total_pages}", callback_data="settings_noop"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(">", callback_data=f"settings_page:{page + 1}"))
-
-    bottom = [
-        InlineKeyboardButton("Reset All", callback_data="reset_settings"),
-        InlineKeyboardButton("Close",     callback_data="close_menu"),
-    ]
-
-    return InlineKeyboardMarkup(action_rows + [nav] + [bottom])
-
-def build_metadata_text() -> str:
+def build_metadata_text(meta: dict) -> str:
+    sep = "─" * 19
+    lines = "\n".join(
+        f"{label} : <code>{meta.get(key) or '-'}</code>"
+        for key, label, _ in METADATA_FIELDS
+    )
     return (
-        "<b>Metadata</b>\n\n"
-        "Set container and stream tags embedded directly into the output file."
+        "<i>Set container and stream tags embedded directly into the output file.</i>\n"
+        f"{sep}\n"
+        f"{lines}\n"
+        f"{sep}"
     )
 
 def build_metadata_keyboard() -> InlineKeyboardMarkup:
@@ -278,8 +268,8 @@ def build_thumbnail_text(settings: dict, subtitle: str = "") -> str:
         f"<b>Thumbnail</b>{extra}\n\n"
         f"Saved Thumbnail : {'<code>Set</code>' if has_thumb else '<code>Not set</code>'}\n"
         f"Auto Detect     : <code>{'On' if auto_detect else 'Off'}</code>\n\n"
-        f"{priority}\n\n"
-        "<i>If nothing is available after the selected priority, no thumbnail is applied.</i>"
+        f"<i>{priority}</i>\n\n"
+        "<blockquote><i>If nothing is available after the selected priority, no thumbnail is applied.</i></blockquote>"
     )
 
 def build_thumbnail_keyboard(settings: dict) -> InlineKeyboardMarkup:
@@ -292,6 +282,34 @@ def build_thumbnail_keyboard(settings: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Back",                callback_data="back_to_menu")],
     ])
 
+def build_caption_text(settings: dict, subtitle: str = "") -> str:
+    custom   = settings.get("custom_caption", "")
+    disabled = settings.get("caption_disabled", False)
+    extra    = f"\n<i>{subtitle}</i>" if subtitle else ""
+
+    if disabled:
+        current_line = "<i>Disabled — files are sent with no caption at all.</i>"
+    elif custom:
+        current_line = f"<code>{escape(custom)}</code>"
+    else:
+        current_line = f"<code>{escape(DEFAULT_CAPTION_TEMPLATE)}</code>  <i>(default)</i>"
+
+    return (
+        f"<b>Caption</b>{extra}\n\n"
+        f"Current:\n{current_line}\n\n"
+        f"Use <code>{escape(CAPTION_PLACEHOLDER)}</code> where the output filename should appear.\n\n"
+        "<blockquote><i>This is the caption sent with files delivered to you — it has no "
+        "effect on the dump-chat caption, which is fixed and applied separately.</i></blockquote>"
+    )
+
+def build_caption_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Caption",        callback_data="cap_view")],
+        [InlineKeyboardButton("Edit Caption",   callback_data="cap_edit"),
+         InlineKeyboardButton("Delete Caption", callback_data="cap_delete")],
+        [InlineKeyboardButton("Back",           callback_data="back_to_menu")],
+    ])
+
 def build_start_episode_text(settings: dict, subtitle: str = "") -> str:
     current = settings.get("default_start_episode", 1)
     extra   = f"\n<i>{subtitle}</i>" if subtitle else ""
@@ -299,7 +317,7 @@ def build_start_episode_text(settings: dict, subtitle: str = "") -> str:
         f"<b>Start Episode</b>{extra}\n\n"
         f"Current: <code>{current}</code>\n\n"
         "This value is used for <code>{episode}</code> in batch rename templates.\n"
-        "<i>Send a new episode number to update it.</i>"
+        "<blockquote><i>Send a new episode number to update it.</i></blockquote>"
     )
 
 def build_start_episode_keyboard() -> InlineKeyboardMarkup:
@@ -331,7 +349,7 @@ def setup_settings_handlers(
         is_group = not message.chat.id == user_id
         chat_id  = message.chat.id
 
-        if not await access_control.is_authorized(user_id):
+        if not await access_control.can_use_premium_features(user_id):
             return
 
         if not is_group:
@@ -351,42 +369,35 @@ def setup_settings_handlers(
         username = user.username or ""
         settings = user_settings(user_id).get()
 
-        text, total_pages = build_settings_text(
+        text = build_settings_text(
             name,
             username,
             user_id,
             settings,
-            page=0,
             split_limit_gib=_split_limit_gib(bool(premium_session_checker and premium_session_checker())),
         )
-        keyboard          = build_main_keyboard(page=0, total_pages=total_pages)
-        thumbnail_path    = get_thumbnail_path(settings, config)
+        keyboard        = build_main_keyboard()
+        photo_source    = SETTINGS_IMAGE_URL
 
         try:
-            if thumbnail_path:
-                sent = await client.send_photo(
-                    chat_id=chat_id,
-                    photo=thumbnail_path,
-                    caption=text,
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                sent = await client.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.HTML,
-                )
+            sent = await client.send_photo(
+                chat_id=chat_id,
+                photo=photo_source,
+                caption=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+            )
             _settings_owner[(chat_id, sent.id)] = user_id
         except Exception:
             await message.reply_text(
-                "Failed to send settings. Please try again.",
+                "<b>▸ Error</b>\n"
+                "────────────────\n"
+                "<i>Failed to send settings. Please try again.</i>",
                 parse_mode=ParseMode.HTML,
             )
 
     @app.on_callback_query(filters.regex(
-        r"^(set_|sendtype_|meta_|reset_|back_to|close_|wm_|cancel_input|settings_|thumb_|start_episode_)"
+        r"^(set_|sendtype_|meta_|reset_|back_to|close_|wm_|cancel_input|settings_|thumb_|start_episode_|cap_)"
     ))
     async def handle_settings_callbacks(client: Client, callback_query: CallbackQuery):
         user    = callback_query.from_user
@@ -397,17 +408,11 @@ def setup_settings_handlers(
         if owner is not None and owner != user_id:
             await callback_query.answer("This is not your settings menu.", show_alert=True)
             return
-        if not await access_control.is_authorized(user_id):
+        if not await access_control.can_use_premium_features(user_id):
             await callback_query.answer("This is not your settings menu.", show_alert=True)
             return
 
         if data == "settings_noop":
-            await callback_query.answer()
-            return
-
-        elif data.startswith("settings_page:"):
-            page = int(data.split(":")[1])
-            await update_main_menu(client, message, user_id, config, page=page)
             await callback_query.answer()
             return
 
@@ -433,8 +438,9 @@ def setup_settings_handlers(
             return
 
         elif data == "set_metadata":
+            meta = user_settings(user_id).get().get("metadata", {})
             await message.edit_text(
-                build_metadata_text(),
+                build_metadata_text(meta),
                 reply_markup=build_metadata_keyboard(),
                 parse_mode=ParseMode.HTML
             )
@@ -496,7 +502,7 @@ def setup_settings_handlers(
             return
 
         elif data == "set_thumbnail":
-            await update_thumbnail_menu(message, user_id)
+            await update_thumbnail_menu(client, message, user_id)
             await callback_query.answer()
             return
 
@@ -523,14 +529,14 @@ def setup_settings_handlers(
             await callback_query.answer(
                 "Auto detect thumbnail enabled" if not current else "Auto detect thumbnail disabled"
             )
-            await update_thumbnail_menu(message, user_id)
+            await update_thumbnail_menu(client, message, user_id)
             return
 
         elif data == "thumb_remove":
             us = user_settings(user_id)
             us.clear_thumbnail()
             await callback_query.answer("Saved thumbnail removed")
-            await update_thumbnail_menu(message, user_id)
+            await update_thumbnail_menu(client, message, user_id)
             return
 
         elif data == "set_watermark":
@@ -796,6 +802,63 @@ def setup_settings_handlers(
             )
             return
 
+        elif data == "set_caption":
+            settings = user_settings(user_id).get()
+            await message.edit_text(
+                build_caption_text(settings),
+                reply_markup=build_caption_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+            await callback_query.answer()
+            return
+
+        elif data == "cap_view":
+            us = user_settings(user_id)
+            if us.is_caption_disabled():
+                popup = "No caption — files are sent without one."
+            else:
+                popup = us.get_caption() or DEFAULT_CAPTION_TEMPLATE
+                if len(popup) > 200:
+                    popup = popup[:197] + "..."
+            await callback_query.answer(popup, show_alert=True)
+            return
+
+        elif data == "cap_edit":
+            sent_message = await message.edit_text(
+                "<b>Edit Caption</b>\n\n"
+                "Send the new caption as HTML text — this is what gets sent "
+                "with every file delivered to you.\n"
+                f"Use <code>{escape(CAPTION_PLACEHOLDER)}</code> where the output filename "
+                "should appear.\n\n"
+                "Example:\n"
+                f"<code>&lt;b&gt;{escape(CAPTION_PLACEHOLDER)}&lt;/b&gt;\n\n"
+                "Uploaded by @MyChannel</code>\n\n"
+                f"Default caption: <code>{escape(DEFAULT_CAPTION_TEMPLATE)}</code>",
+                reply_markup=build_cancel_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+            user_settings(user_id).temp_state[user_id] = {
+                "chat_id":            message.chat.id,
+                "settings_message_id": message.id,
+                "state":              "waiting_caption",
+                "prompt_message_id":  sent_message.id,
+                "back_to":            "caption",
+            }
+            await callback_query.answer()
+            return
+
+        elif data == "cap_delete":
+            us = user_settings(user_id)
+            us.disable_caption()
+            await callback_query.answer("Caption deleted — files will be sent without a caption")
+            settings = us.get()
+            await message.edit_text(
+                build_caption_text(settings, "Caption deleted — files are sent with no caption"),
+                reply_markup=build_caption_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+            return
+
         elif data == "set_start_episode":
             settings = user_settings(user_id).get()
             await message.edit_text(
@@ -866,8 +929,9 @@ def setup_settings_handlers(
                     parse_mode=ParseMode.HTML
                 )
             elif back_to == "metadata":
+                meta = user_settings(user_id).get().get("metadata", {})
                 await message.edit_text(
-                    build_metadata_text(),
+                    build_metadata_text(meta),
                     reply_markup=build_metadata_keyboard(),
                     parse_mode=ParseMode.HTML
                 )
@@ -879,7 +943,14 @@ def setup_settings_handlers(
                     parse_mode=ParseMode.HTML
                 )
             elif back_to == "thumbnail":
-                await update_thumbnail_menu(message, user_id)
+                await update_thumbnail_menu(client, message, user_id)
+            elif back_to == "caption":
+                settings = us.get()
+                await message.edit_text(
+                    build_caption_text(settings),
+                    reply_markup=build_caption_keyboard(),
+                    parse_mode=ParseMode.HTML
+                )
             else:
                 await update_main_menu(client, message, user_id, config)
             return
@@ -901,59 +972,82 @@ def setup_settings_handlers(
 
         await callback_query.answer()
 
-    async def update_thumbnail_menu(message, user_id):
-        settings = user_settings(user_id).get()
-        await message.edit_text(
-            build_thumbnail_text(settings),
-            reply_markup=build_thumbnail_keyboard(settings),
-            parse_mode=ParseMode.HTML
-        )
+    async def update_thumbnail_menu(client, message, user_id, subtitle=""):
+        settings       = user_settings(user_id).get()
+        text           = build_thumbnail_text(settings, subtitle)
+        keyboard       = build_thumbnail_keyboard(settings)
+        thumbnail_path = get_thumbnail_path(settings, config)
+        photo_source   = thumbnail_path or SETTINGS_IMAGE_URL
+        chat_id        = message.chat.id
 
-    async def update_main_menu(client, message, user_id, config, page: int = 0):
+        try:
+            if message.photo:
+                await message.edit_media(
+                    media=InputMediaPhoto(media=photo_source, caption=text, parse_mode=ParseMode.HTML),
+                    reply_markup=keyboard
+                )
+                return message
+            else:
+                await message.delete()
+                sent = await client.send_photo(
+                    chat_id=chat_id, photo=photo_source, caption=text,
+                    reply_markup=keyboard, parse_mode=ParseMode.HTML
+                )
+                _settings_owner[(chat_id, sent.id)] = user_id
+                return sent
+        except Exception:
+            try:
+                sent = await client.send_photo(
+                    chat_id=chat_id, photo=photo_source, caption=text,
+                    reply_markup=keyboard, parse_mode=ParseMode.HTML
+                )
+                _settings_owner[(chat_id, sent.id)] = user_id
+                return sent
+            except Exception:
+                return None
+
+    async def update_main_menu(client, message, user_id, config):
         user     = await client.get_users(user_id)
         name     = f"{user.first_name or ''} {user.last_name or ''}".strip()
         username = user.username or ""
         settings = user_settings(user_id).get()
         chat_id  = message.chat.id
 
-        text, total_pages = build_settings_text(
+        text = build_settings_text(
             name,
             username,
             user_id,
             settings,
-            page=page,
             split_limit_gib=_split_limit_gib(bool(premium_session_checker and premium_session_checker())),
         )
-        keyboard          = build_main_keyboard(page=page, total_pages=total_pages)
-        thumbnail_path    = get_thumbnail_path(settings, config)
+        keyboard        = build_main_keyboard()
+        photo_source    = SETTINGS_IMAGE_URL
 
         try:
-            if message.photo and thumbnail_path:
+            if message.photo:
                 await message.edit_media(
-                    media=InputMediaPhoto(media=thumbnail_path, caption=text, parse_mode=ParseMode.HTML),
+                    media=InputMediaPhoto(media=photo_source, caption=text, parse_mode=ParseMode.HTML),
                     reply_markup=keyboard
                 )
-            elif message.text and thumbnail_path:
+            else:
                 await message.delete()
                 sent = await client.send_photo(
                     chat_id=chat_id,
-                    photo=thumbnail_path,
+                    photo=photo_source,
                     caption=text,
                     reply_markup=keyboard,
                     parse_mode=ParseMode.HTML
                 )
                 _settings_owner[(chat_id, sent.id)] = user_id
-            else:
-                await message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         except Exception:
             try:
-                await message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-            except Exception:
-                sent = await client.send_message(
-                    chat_id=chat_id, text=text,
+                sent = await client.send_photo(
+                    chat_id=chat_id, photo=photo_source, caption=text,
                     reply_markup=keyboard, parse_mode=ParseMode.HTML
                 )
                 _settings_owner[(chat_id, sent.id)] = user_id
+            except Exception:
+                pass
 
     _not_a_command = filters.create(lambda _, __, m: not (m.text or "").startswith("/"))
 
@@ -973,7 +1067,6 @@ def setup_settings_handlers(
         chat_id           = state_data.get("chat_id", user_id) if isinstance(state_data, dict) else user_id
         settings_message_id = state_data.get("settings_message_id") if isinstance(state_data, dict) else None
 
-        # A prompt opened in one group must not consume an unrelated message in another.
         if message.chat.id != chat_id:
             return
 
@@ -1010,7 +1103,9 @@ def setup_settings_handlers(
             value = message.text.strip()
             if not value:
                 await message.reply_text(
-                    "Metadata value cannot be empty. Please send a value.",
+                    "<b>▸ Empty Value</b>\n"
+                    "────────────────\n"
+                    "<i>Metadata value cannot be empty. Please send a value.</i>",
                     parse_mode=ParseMode.HTML
                 )
                 return
@@ -1026,15 +1121,23 @@ def setup_settings_handlers(
             name     = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip()
             username = user_obj.username or ""
             settings = us.get()
-            text_out, total_pages = build_settings_text(name, username, user_id, settings, page=1)
-            await _edit_settings(text_out, build_main_keyboard(page=1, total_pages=total_pages))
+            text_out = build_settings_text(
+                name, username, user_id, settings,
+                split_limit_gib=_split_limit_gib(bool(premium_session_checker and premium_session_checker())),
+            )
+            await _edit_settings(text_out, build_main_keyboard())
 
         elif state.startswith("waiting_meta_"):
             field = state.replace("waiting_meta_", "", 1)
             if field == "title":
                 field = "title_all"
             if field not in METADATA_FIELD_BY_KEY:
-                await message.reply_text("Unknown metadata field.", parse_mode=ParseMode.HTML)
+                await message.reply_text(
+                    "<b>▸ Unknown Field</b>\n"
+                    "────────────────\n"
+                    "<i>That metadata field was not recognized.</i>",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
             us.update_metadata(**{field: message.text})
             del us.temp_state[user_id]
@@ -1043,8 +1146,57 @@ def setup_settings_handlers(
             name     = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip()
             username = user_obj.username or ""
             settings = us.get()
-            text_out, total_pages = build_settings_text(name, username, user_id, settings, page=1)
-            await _edit_settings(text_out, build_main_keyboard(page=1, total_pages=total_pages))
+            text_out = build_settings_text(
+                name, username, user_id, settings,
+                split_limit_gib=_split_limit_gib(bool(premium_session_checker and premium_session_checker())),
+            )
+            await _edit_settings(text_out, build_main_keyboard())
+
+        elif state == "waiting_caption":
+            caption_text = (message.text or "").strip()
+            if not caption_text:
+                await message.reply_text(
+                    "<b>▸ Empty Caption</b>\n"
+                    "────────────────\n"
+                    "Send some HTML text, or use "
+                    "<b>Delete Caption</b> to send files with no caption at all.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            preview = caption_text.replace(CAPTION_PLACEHOLDER, _CAPTION_PREVIEW_NAME)
+
+            try:
+                preview_msg = await client.send_message(
+                    chat_id, f"<b>Preview</b>:\n{preview}", parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                await message.reply_text(
+                    "<b>▸ Invalid HTML</b>\n"
+                    "────────────────\n"
+                    "That caption wasn't saved.\n"
+                    f"<code>{escape(str(e))}</code>\n\n"
+                    "<blockquote><i>Tip:</i> only Telegram's supported tags work here — "
+                    "<code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;u&gt;</code>, "
+                    "<code>&lt;s&gt;</code>, <code>&lt;code&gt;</code>, <code>&lt;pre&gt;</code>, "
+                    "<code>&lt;a href=...&gt;</code> — and every tag must be closed.</blockquote>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            try:
+                await client.delete_messages(chat_id=chat_id, message_ids=[preview_msg.id])
+            except Exception:
+                pass
+
+            us.set_caption(caption_text)
+            del us.temp_state[user_id]
+            await _cleanup()
+            settings = us.get()
+            await _edit_settings(
+                build_caption_text(settings, "Caption updated"),
+                build_caption_keyboard(),
+            )
 
         elif state == "waiting_wm_text":
             text_val = message.text.strip()
@@ -1058,7 +1210,12 @@ def setup_settings_handlers(
                     build_watermark_keyboard(wm),
                 )
             else:
-                await message.reply_text("Text cannot be empty.", parse_mode=ParseMode.HTML)
+                await message.reply_text(
+                    "<b>▸ Empty Value</b>\n"
+                    "────────────────\n"
+                    "<i>Text cannot be empty.</i>",
+                    parse_mode=ParseMode.HTML,
+                )
 
         elif state == "waiting_wm_range_start":
             try:
@@ -1218,7 +1375,9 @@ def setup_settings_handlers(
             raw = message.text.strip()
             if not raw.isdigit() or int(raw) < 1:
                 await message.reply_text(
-                    "Please send a valid episode number ≥ 1.", parse_mode=ParseMode.HTML
+                    "<b>▸ Invalid Value</b>\n"
+                    "────────────────\n"
+                    "Please send a valid episode number ≥ <code>1</code>.", parse_mode=ParseMode.HTML
                 )
                 return
             us.update("default_start_episode", raw)
@@ -1269,21 +1428,24 @@ def setup_settings_handlers(
                 except Exception:
                     pass
 
-            result_text     = build_thumbnail_text(us.get(), "Thumbnail saved")
-            result_keyboard = build_thumbnail_keyboard(us.get())
+            settings_message = None
             if settings_message_id:
                 try:
-                    await client.edit_message_text(
-                        chat_id=chat_id, message_id=settings_message_id,
-                        text=result_text, reply_markup=result_keyboard,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return
+                    settings_message = await client.get_messages(chat_id, settings_message_id)
                 except Exception:
-                    pass
-            sent = await client.send_message(
-                chat_id=chat_id, text=result_text,
-                reply_markup=result_keyboard, parse_mode=ParseMode.HTML,
+                    settings_message = None
+
+            if settings_message is not None:
+                rendered = await update_thumbnail_menu(client, settings_message, user_id, "Thumbnail saved")
+                if rendered is not None:
+                    return
+
+            result_text     = build_thumbnail_text(us.get(), "Thumbnail saved")
+            result_keyboard = build_thumbnail_keyboard(us.get())
+            thumbnail_path  = get_thumbnail_path(us.get(), config)
+            sent = await client.send_photo(
+                chat_id=chat_id, photo=thumbnail_path or SETTINGS_IMAGE_URL,
+                caption=result_text, reply_markup=result_keyboard, parse_mode=ParseMode.HTML,
             )
             _settings_owner[(chat_id, sent.id)] = user_id
 
@@ -1329,7 +1491,12 @@ def setup_settings_handlers(
             downloaded = await client.download_media(message, file_name=tmp_path)
 
             if not downloaded or not os.path.exists(downloaded):
-                await message.reply_text("Failed to download font file. Please try again.", parse_mode=ParseMode.HTML)
+                await message.reply_text(
+                    "<b>▸ Download Failed</b>\n"
+                    "────────────────\n"
+                    "<i>Could not download the font file. Please try again.</i>",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
 
             font_name = us.set_watermark_font(os.path.abspath(downloaded))

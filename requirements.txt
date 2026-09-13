@@ -2,12 +2,12 @@
 # since 2023 and uploads/downloads one chunk at a time over a single
 # connection per file — this is the main reason a Premium session's raw
 # upload throughput can sit around 1-2 MB/s regardless of concurrency
-# settings. kurigram is a maintained, drop-in-compatible fork (still
-# `import pyrogram` in code) with real parallel part transfer, which is
-# usually the single biggest lever for single-file transfer speed. If you
-# need to stay on stock pyrogram for any reason, swap this line back.
-kurigram
-tgcrypto
+# settings. wzgram is a maintained, drop-in-compatible fork (still
+# `import pyrogram` in code) with real parallel part transfer via
+# max_concurrent_transmissions, which is usually the single biggest lever
+# for single-file transfer speed. If you need to stay on stock pyrogram or
+# kurigram for any reason, swap this line back.
+wzgram
 python-dotenv
 FFmpeg-python
 pydantic
@@ -20,4 +20,5 @@ telegraph
 httpx
 fonttools
 pymediainfo
+Pillow
 motor

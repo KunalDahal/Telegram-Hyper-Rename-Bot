@@ -62,9 +62,6 @@ class Config:
 
         self.api_hash: str = os.getenv("API_HASH", "").strip()
 
-        # Optional. Leave empty for a DM-only bot; commands always work in DM
-        # regardless of this setting (see chat_scope_filter). Any IDs listed
-        # here additionally allow the same commands inside those group chats.
         self.allowed_group_ids: List[int] = [
             gid for gid in self._parse_int_list(os.getenv("ALLOWED_GROUP_IDS", ""))
             if gid != 0
@@ -96,11 +93,6 @@ class Config:
             "",
         ).strip()
 
-        # Telegram targets stay as strings because:
-        # - BOT_DUMP_CHAT_ID may be a numeric -100... ID, public @username,
-        #   or a private invite URL for the bot-side dump.
-        # - DUMP_CHAT_ID may be a private invite URL or public @username for
-        #   the optional Premium SESSION_STRING.
         self.dump_chat_id: str | None = self._optional_chat_target_env(
             "DUMP_CHAT_ID"
         )
@@ -108,29 +100,13 @@ class Config:
             "BOT_DUMP_CHAT_ID"
         )
 
-        # WORKERS is the single knob for all concurrency in the bot: it caps
-        # how many complete rename jobs (download -> process -> upload) run
-        # at once, and each stage (download, upload, watermark processing)
-        # is allowed up to that same number in parallel. Premium and normal
-        # tasks share this one pool -- e.g. WORKERS=4 means at most 4 jobs
-        # total (premium + normal combined) run at a time, at most 4
-        # downloads at a time, and at most 4 uploads at a time.
         self.workers = self._positive_int_env("WORKERS", default=4)
 
-        # Kept as an alias so any code that still reads max_rename_at_once
-        # keeps working.
         self.max_rename_at_once = self.workers
 
-        # Pyrogram's bot Client separately takes max_concurrent_transmissions,
-        # a SINGLE shared cap on that one Client's simultaneous network
-        # transmissions for downloads AND uploads combined. It has to cover
-        # a full download batch and a full upload batch running together
-        # (WORKERS each), so it's sized at 2x WORKERS.
         self.bot_transmission_limit = self.workers * 2
 
-        # UPLOAD_PART_WORKERS -> config.upload_part_workers -> the bot
-        # Client's max_concurrent_transmissions (see __main__.py).
-        self.upload_part_workers = self._positive_int_env("UPLOAD_PART_WORKERS", default=8)
+        self.upload_part_workers = self._positive_int_env("UPLOAD_PART_WORKERS", default=16)
         self.command_postfix = self._command_postfix_env()
 
         self.paths = Paths(self._SRC_DIR)
@@ -196,7 +172,6 @@ class Config:
         if not self.api_hash:
             raise ValueError("API_HASH is required")
 
-        # ALLOWED_GROUP_IDS is optional: commands work in DM either way.
 
         if not self.owner_ids:
             raise ValueError("OWNER_IDS is required")
@@ -207,7 +182,6 @@ class Config:
         if not self.mongo_db_name:
             raise ValueError("MONGO_DB_NAME cannot be empty")
 
-        # Bot-side dump is independent from the optional Premium session.
         if self.bot_dump_chat_id is None:
             raise ValueError(
                 "BOT_DUMP_CHAT_ID is required for the bot session. "
@@ -215,6 +189,3 @@ class Config:
                 "the bot-side dump channel."
             )
 
-        # DUMP_CHAT_ID is optional. Premium uploads use BOT_DUMP_CHAT_ID as
-        # the canonical staging target so BOT_TOKEN can always copy the result
-        # to the user's DM. DUMP_CHAT_ID is retained only for compatibility.

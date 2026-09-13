@@ -1,4 +1,3 @@
-"""Bootstrap-owner-only clean process restart."""
 
 import asyncio
 import os
@@ -25,13 +24,19 @@ def setup_restart_handler(app: Client, task_queue, config, access_control) -> No
         if not user or not access_control.is_owner(user.id):
             return
         if _restart_scheduled:
-            await message.reply_text("A clean restart is already in progress.")
+            await message.reply_text(
+                "<b>▸ Restart In Progress</b>\n"
+                "────────────────\n"
+                "<i>A clean restart is already running.</i>"
+            )
             return
 
         _restart_scheduled = True
         await message.reply_text(
-            "Restarting cleanly: cancelling tasks, clearing Mongo task records and temporary files. "
-            "Administrator records and the Pyrogram session will be preserved.",
+            "<b>▸ Restarting</b>\n"
+            "────────────────\n"
+            "Cancelling tasks, clearing task records and temporary files.\n\n"
+            "<blockquote><u>Preserved:</u> admin records and the login session.</blockquote>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -46,8 +51,6 @@ def setup_restart_handler(app: Client, task_queue, config, access_control) -> No
             await task_queue.flush_checkpoints()
             await access_control.task_store.clear_all()
 
-            # The session lives under config.paths.logs and is intentionally
-            # not touched; exec replaces this process without creating a new session.
             await app.stop()
             os.execv(sys.executable, [sys.executable, *sys.argv])
 

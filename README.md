@@ -20,7 +20,7 @@ watermarks, and ordered batch processing.
 - Generate a Telegraph-hosted MediaInfo page from a replied media file.
 - Queue work globally, show live task status, and cancel queued or running jobs.
 - Recover active task records after an unexpected restart.
-- Restrict access to bootstrap owners and MongoDB-managed administrators.
+- Restrict access to bootstrap owners and Premium users.
 - Optionally use a Telegram Premium user session for downloads up to 4 GiB.
 
 ## Supported input formats
@@ -34,6 +34,10 @@ Commands use the numeric `COMMAND_POSTFIX` configured for the bot. With the
 default value `0`, use `/rename`; with `COMMAND_POSTFIX=2`, use `/rename2`.
 Every command below follows this rule.
 
+Most commands below require Premium access — see
+[Access control](#access-control) below. `/plans` and `/myplan` are always
+available so anyone can check what Premium unlocks and whether they have it.
+
 | Command | Aliases | Use |
 | --- | --- | --- |
 | `/start` | `/help` | Open the bot help message. |
@@ -43,20 +47,51 @@ Every command below follows this rule.
 | `/es` | `/us`, `/settings`, `/usersettings` | Open personal rename, metadata, thumbnail, send-mode, and watermark settings. |
 | `/ss <episode>` | `/set_start_episode <episode>` | Set the starting episode number for batch names; `/ss 001` preserves the padding. |
 | `/st` | `/setthumb` | Reply to an image to save it as your output thumbnail. |
+| `/set_caption <caption>` | — | Set a custom delivery caption. Use `{filename}` as a placeholder for the output filename. Defaults to `<code>{filename}</code>`. |
+| `/see_caption` | — | Show your saved custom caption (and a preview), or the default if you haven't set one. |
+| `/del_caption` | — | Delete your custom caption and go back to the default. |
 | `/status` | `/s` | Show task queue status and task IDs. |
 | `/cancel <task_id>` | `/c <task_id>` | Cancel one queued or running task. |
 | `/mi` | — | Reply to media to generate a MediaInfo page. |
-| `/restart` | — | Cancel tasks, remove task records and temporary files, then restart the bot. Available to authorized users. |
+| `/plans` | — | List available Premium plans. Open to everyone. |
+| `/myplan` | — | Show your Premium status, plan, and expiry. Open to everyone. |
+| `/restart` | — | Cancel tasks, remove task records and temporary files, then restart the bot. Owner-only. |
 
-### Bootstrap-owner commands
+### Access control
+
+Two groups can interact with the bot:
+
+- **Bootstrap owners** (`OWNER_IDS`, comma-separated — more than one is
+  supported) can use every Premium-protected feature plus every owner-only
+  command below.
+- **Premium users** (MongoDB-backed) can use the Premium-protected features
+  (`/rename`, `/es`, `/ss`, `/st`, `/set_caption`, `/see_caption`,
+  `/del_caption`, `/status`, `/cancel`, `/mi`), but not owner-only commands.
+- **Everyone else** can use `/start`/`/help`, `/plans`, and `/myplan` only.
+
+There is no separate admin tier — an owner grants elevated access to someone
+else by making them Premium with `/addpremium`, not by adding them as an
+admin.
+
+### Owner-only commands
 
 Only IDs listed in `OWNER_IDS` can use these commands.
 
-| Command | Legacy alias | Use |
-| --- | --- | --- |
-| `/add_admin <user_id>` | `/add_workers <user_id>` | Grant MongoDB-backed administrator access. |
-| `/remove_admin <user_id>` | `/remove_workers <user_id>` | Revoke an administrator's access. Bootstrap owners cannot be removed. |
-| `/list_admin` | `/view_workers` | List administrators. |
+| Command | Use |
+| --- | --- |
+| `/restart` | Cancel tasks, remove task records and temporary files, then restart the bot. |
+| `/addpremium <user_id> [plan] [duration_days]` | Grant a user Premium access. Two plans are offered: `1 Month` (pass a `duration_days` of `30`) and `Lifetime` (omit `duration_days`, or pass `0`). `plan` defaults to `Standard` if omitted. |
+| `/remove_premium <user_id>` | Revoke a user's Premium access. |
+| `/premium_users` | List every Premium user, their plan, and their expiry. |
+| `/ban <user_id> [reason]` | Ban a user from using the bot. Owners can't be banned. |
+| `/unban <user_id>` | Unban a user. |
+| `/banned_users` | List every currently banned user, with who banned them and why. |
+
+A ban overrides Premium access once set, and works independently of it.
+
+The "🗑 Cancel All" button on `/status` is also owner-only — Premium users
+see the task list and pagination, but not that button.
+
 
 ## Rename examples
 
@@ -185,8 +220,8 @@ docker compose logs -f
 ```
 
 The compose configuration persists `src/bin` for local logs and active work
-files. MongoDB stores administrators, user settings, thumbnails, watermark
-fonts, and task records.
+files. MongoDB stores Premium/banned users, user settings, thumbnails,
+watermark fonts, and task records.
 
 ## Heroku deployment
 
@@ -212,7 +247,7 @@ cluster, but each must have a different `MONGO_DB_NAME`, for example
 names; it does not make duplicate workers for a token safe.
 
 Heroku's filesystem is ephemeral. Downloaded work files are not durable across
-a dyno replacement, but MongoDB-backed administrators, user settings,
+a dyno replacement, but MongoDB-backed Premium/banned users, user settings,
 thumbnails, watermark fonts, and task records persist.
 
 ## Premium download session

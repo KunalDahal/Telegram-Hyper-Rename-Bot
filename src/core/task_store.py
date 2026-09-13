@@ -1,4 +1,3 @@
-"""Durable MongoDB storage for rename-task checkpoints and history."""
 
 from __future__ import annotations
 
@@ -12,11 +11,10 @@ from pymongo.errors import PyMongoError
 
 
 class TaskStoreError(RuntimeError):
-    """Raised when a task checkpoint cannot be saved or restored."""
+    pass
 
 
 class TaskStore:
-    """Persists active tasks so an unplanned process restart can recover them."""
 
     def __init__(self, client: AsyncIOMotorClient, database_name: str = "renamer_bot"):
         database = client[database_name]
@@ -31,7 +29,6 @@ class TaskStore:
             raise TaskStoreError("Unable to initialize MongoDB task storage.") from exc
 
     async def save_active(self, task: dict) -> None:
-        """Store the latest task state and progress checkpoint."""
         task_id = task.get("task_id")
         if not task_id:
             return
@@ -73,7 +70,6 @@ class TaskStore:
             raise TaskStoreError(f"Unable to archive task {task_id}.") from exc
 
     async def clear_all(self) -> int:
-        """Remove active and historical task records, but never administrator data."""
         try:
             result = await self._tasks.delete_many({})
             return result.deleted_count

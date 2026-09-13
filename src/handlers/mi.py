@@ -9,22 +9,24 @@ from pyrogram.types import Message
 from src.utils.commands import command_filter, chat_scope_filter
 from src.utils.telegraphpage import MediaInfoHelper
 
-# ─── Singleton ────────────────────────────────────────────────────────────────
 _telegraph = MediaInfoHelper()
 
 PARTIAL_BYTES = 3 * 1024 * 1024
 
 
-# ─── Handler ──────────────────────────────────────────────────────────────────
-
 async def _handle_mi_command(client, message: Message, access_control):
     user = message.from_user
-    if not user or not await access_control.is_authorized(user.id):
+    if not user or not await access_control.can_use_premium_features(user.id):
         return
 
     replied = message.reply_to_message
     if not replied:
-        await message.reply_text("⚠️ Reply to a media file with /mi to get its MediaInfo.")
+        await message.reply_text(
+            "<b>▸ Usage</b>\n"
+            "────────────────\n"
+            "Reply to a media file with <code>/mi</code> to get its MediaInfo.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     media = (
@@ -35,7 +37,12 @@ async def _handle_mi_command(client, message: Message, access_control):
         or replied.video_note
     )
     if not media:
-        await message.reply_text("⚠️ The replied message contains no supported media.")
+        await message.reply_text(
+            "<b>▸ Unsupported</b>\n"
+            "────────────────\n"
+            "<i>The replied message contains no supported media.</i>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     filename  = getattr(media, "file_name", None) or f"file_{media.file_id[:8]}"
@@ -43,10 +50,14 @@ async def _handle_mi_command(client, message: Message, access_control):
     save_path = os.path.join(tmp_dir, filename)
 
     os.makedirs(tmp_dir, exist_ok=True)
-    status_msg = await message.reply_text("⏳ Downloading partial file…")
+    status_msg = await message.reply_text(
+        "<b>▸ Downloading</b>\n"
+        "────────────────\n"
+        "<i>Fetching a partial copy of the file…</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
     try:
-        # ── 1. Partial download (head only) ───────────────────────────────────
         await _telegraph.download_partial(
             client=client,
             media=media,
@@ -54,31 +65,43 @@ async def _handle_mi_command(client, message: Message, access_control):
             max_bytes=PARTIAL_BYTES,
         )
 
-        # ── 2. Generate Telegraph page ────────────────────────────────────────
-        await status_msg.edit_text("🔍 Generating MediaInfo page…")
+        await status_msg.edit_text(
+            "<b>▸ Analyzing</b>\n"
+            "────────────────\n"
+            "<i>Generating the MediaInfo page…</i>",
+            parse_mode=ParseMode.HTML,
+        )
         url, err = await _telegraph.generate_mediainfo(save_path, filename)
 
         if err:
-            await status_msg.edit_text(f"❌ Error: {err}")
+            await status_msg.edit_text(
+                f"<b>▸ Error</b>\n"
+                f"────────────────\n"
+                f"<code>{err}</code>",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-        # ── 3. Reply with link ────────────────────────────────────────────────
         await status_msg.edit_text(
-            f"📄 <b>MediaInfo</b>\n"
-            f"<b>File:</b> <code>{filename}</code>\n"
-            f"<b>Link:</b> {url}",
+            f"<b>▸ MediaInfo</b>\n"
+            f"────────────────\n"
+            f"<b>File</b> → <code>{filename}</code>\n"
+            f"<b>Link</b> → {url}",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Failed: {e}")
+        await status_msg.edit_text(
+            f"<b>▸ Failed</b>\n"
+            f"────────────────\n"
+            f"<code>{e}</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-
-# ─── Register ─────────────────────────────────────────────────────────────────
 
 def setup_mediainfo_handlers(app, config, access_control) -> None:
     allowed_filter = chat_scope_filter(config)

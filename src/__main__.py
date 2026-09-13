@@ -32,9 +32,14 @@ from src.handlers.cancel import setup_cancel_handlers, set_worker_instance
 from src.handlers.restart import setup_restart_handler
 from src.handlers.rename import setup_rename_handler
 from src.handlers.set import setup_set_handlers
-from src.utils.workers import setup_worker_handlers, sync_bot_command_scopes
+from src.utils.workers import sync_bot_command_scopes
+from src.utils.premium import setup_premium_handlers
+from src.utils.moderation import setup_moderation_handlers
 from src.handlers.mi import setup_mediainfo_handlers
 from src.utils.session_persistence import ensure_persistent_session
+from src.utils.output_style import apply_global_styling
+
+apply_global_styling()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,14 +56,6 @@ async def main():
         "BOT_SESSION_STRING" if config.bot_session_string else "file-based Pyrogram session",
     )
 
-    # Pyrogram/kurigram's Client always forces MemoryStorage whenever
-    # `session_string` is passed to the constructor -- `in_memory=False`
-    # is silently ignored in that case. So passing both, as this used to
-    # do, gave a peer cache that was wiped every restart. To get a real
-    # file-backed peer cache we materialize the on-disk session once from
-    # BOT_SESSION_STRING, then start the Client on that file directly
-    # (no `session_string=`), so every peer it resolves is written to
-    # disk immediately and survives the next restart.
     await ensure_persistent_session(
         "encode_bot_session", config.paths.logs, config.bot_session_string
     )
@@ -112,6 +109,7 @@ async def main():
                 api_id=config.api_id,
                 api_hash=config.api_hash,
                 bot_token=token,
+                workers=32,
                 workdir=config.paths.logs,
                 in_memory=True,
             )
@@ -202,7 +200,12 @@ async def main():
                 worker.has_premium_download_session
             ),
         )
-        setup_worker_handlers(
+        setup_premium_handlers(
+            app=app,
+            config=config,
+            access_control=access_control,
+        )
+        setup_moderation_handlers(
             app=app,
             config=config,
             access_control=access_control,
@@ -215,9 +218,6 @@ async def main():
 
         await sync_bot_command_scopes(app, config, access_control)
 
-        # Start the worker under supervision. If Worker.start() raises,
-        # the exception must reach the main task instead of becoming
-        # "Task exception was never retrieved" while the bot stays alive.
         worker_task = asyncio.create_task(
             worker.start(),
             name="telegram-rename-worker",
@@ -243,11 +243,8 @@ async def main():
             )
 
             if worker_task in done:
-                # Propagate the worker startup/runtime exception.
                 worker_task.result()
 
-            # Normal shutdown path: Pyrogram idle() completed.
-            # Stop/cancel the worker below.
             return
 
         finally:

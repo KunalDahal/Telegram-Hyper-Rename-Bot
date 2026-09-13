@@ -17,6 +17,7 @@ _active_page:   dict[int, int]            = {}
 _last_content:  dict[int, str]            = {}
 _refresh_tasks: dict[int, asyncio.Task]   = {}
 _last_progress: dict[tuple[str, str], float] = {}
+_status_is_owner: dict[int, bool]         = {}
 
 AUTO_REFRESH_INTERVAL = 3
 _BAR_LEN = 10
@@ -35,35 +36,37 @@ def _progress_bar(pct: float) -> str:
     return f"[{'█' * filled}{'░' * empty}] {pct:.1f}%"
 
 
-def _build_keyboard(page: int, total_pages: int, has_tasks: bool) -> InlineKeyboardMarkup | None:
+def _build_keyboard(page: int, total_pages: int, has_tasks: bool, show_cancel_all: bool) -> InlineKeyboardMarkup | None:
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"status_page:{page - 1}"))
+        nav.append(InlineKeyboardButton("‹ Prev", callback_data=f"status_page:{page - 1}"))
     if total_pages > 1:
         nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="status_page:noop"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"status_page:{page + 1}"))
+        nav.append(InlineKeyboardButton("Next ›", callback_data=f"status_page:{page + 1}"))
 
     rows = []
     if nav:
         rows.append(nav)
-    if has_tasks:
-        rows.append([InlineKeyboardButton("🗑 Cancel All", callback_data="status_cancel_all:confirm")])
+    if has_tasks and show_cancel_all:
+        rows.append([InlineKeyboardButton("▸ Cancel All", callback_data="status_cancel_all:confirm")])
 
     return InlineKeyboardMarkup(rows) if rows else None
 
 
 async def _check_access(client, message: Message, access_control) -> bool:
     user = message.from_user
-    if not user or not await access_control.is_authorized(user.id):
+    if not user or not await access_control.can_use_premium_features(user.id):
         return False
     try:
         await client.get_chat(user.id)
     except Exception:
         bot_username = (await client.get_me()).username
         await message.reply_text(
-            f"⚠️ Please start the bot in DM first.\n"
-            f"👉 @{bot_username} — press <b>Start</b>, then try again.",
+            f"<b>▸ Start Required</b>\n"
+            f"────────────────\n"
+            f"Please start the bot in <u>DM</u> first.\n\n"
+            f"<code>@{bot_username}</code> → press <b>Start</b>, then try again.",
             parse_mode=enums.ParseMode.HTML,
         )
         return False
@@ -71,7 +74,6 @@ async def _check_access(client, message: Message, access_control) -> bool:
 
 
 def setup_status_handlers(app: Client, task_queue, config, access_control):
-    # /status is group-only: it must never run in a private chat.
     @app.on_message(command_filter(config, ["s", "status"]) & group_scope_filter(config))
     async def status_command(client: Client, message: Message):
         if not await _check_access(client, message, access_control):
@@ -79,6 +81,7 @@ def setup_status_handlers(app: Client, task_queue, config, access_control):
 
         chat_id = message.chat.id
         _cancel_refresh(chat_id)
+        _status_is_owner[chat_id] = access_control.is_owner(message.from_user.id)
 
         old_id = _active_status.pop(chat_id, None)
         if old_id:
@@ -100,7 +103,7 @@ def setup_status_handlers(app: Client, task_queue, config, access_control):
         chat_id = callback_query.message.chat.id
         if not chat_in_group_scope(config, chat_id):
             return
-        if not await access_control.is_authorized(callback_query.from_user.id):
+        if not await access_control.can_use_premium_features(callback_query.from_user.id):
             return
 
         await callback_query.answer()
@@ -126,7 +129,8 @@ def setup_status_handlers(app: Client, task_queue, config, access_control):
         chat_id = callback_query.message.chat.id
         if not chat_in_group_scope(config, chat_id):
             return
-        if not await access_control.is_authorized(callback_query.from_user.id):
+        if not access_control.is_owner(callback_query.from_user.id):
+            await callback_query.answer("Owner only.", show_alert=True)
             return
         if _active_status.get(chat_id) != callback_query.message.id:
             return
@@ -134,11 +138,14 @@ def setup_status_handlers(app: Client, task_queue, config, access_control):
         await callback_query.answer()
         try:
             await callback_query.message.edit_text(
-                "⚠️ <b>Are you sure you want to cancel ALL active tasks?</b>\nThis cannot be undone.",
+                "<b>▸ Confirm</b>\n"
+                "────────────────\n"
+                "Cancel <u>ALL</u> active tasks?\n"
+                "<blockquote><i>This cannot be undone.</i></blockquote>",
                 parse_mode=enums.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Yes, Cancel All", callback_data="status_cancel_all:yes"),
-                    InlineKeyboardButton("❌ No",              callback_data="status_cancel_all:no"),
+                    InlineKeyboardButton("▸ Yes, Cancel All", callback_data="status_cancel_all:yes"),
+                    InlineKeyboardButton("▸ No",              callback_data="status_cancel_all:no"),
                 ]]),
             )
             _last_content.pop(chat_id, None)
@@ -150,7 +157,8 @@ def setup_status_handlers(app: Client, task_queue, config, access_control):
         chat_id = callback_query.message.chat.id
         if not chat_in_group_scope(config, chat_id):
             return
-        if not await access_control.is_authorized(callback_query.from_user.id):
+        if not access_control.is_owner(callback_query.from_user.id):
+            await callback_query.answer("Owner only.", show_alert=True)
             return
         if _active_status.get(chat_id) != callback_query.message.id:
             return
@@ -172,8 +180,6 @@ def setup_status_handlers(app: Client, task_queue, config, access_control):
             task = task_queue.get_task(tid)
             if not task or task.get("status") not in _ACTIVE_STATUSES:
                 continue
-            # Only cancel tasks that were queued from THIS chat. Groups don't
-            # share a queue view, so "Cancel All" must not touch other chats.
             if task.get("chat_id") != chat_id:
                 continue
             try:
@@ -189,7 +195,9 @@ def setup_status_handlers(app: Client, task_queue, config, access_control):
 
         try:
             await callback_query.message.edit_text(
-                f"✅ <b>Cancelled {cancelled} task(s).</b>",
+                f"<b>▸ Done</b>\n"
+                f"────────────────\n"
+                f"Cancelled <u>{cancelled}</u> task(s).",
                 parse_mode=enums.ParseMode.HTML,
             )
             _last_content.pop(chat_id, None)
@@ -228,7 +236,7 @@ async def _auto_refresh_loop(client, chat_id: int, status_msg, task_queue, confi
 
 async def _send_status(client, message, task_queue, chat_id, config, page=0) -> Message | None:
     text, total_pages, has_tasks = _build_status_content(task_queue, chat_id, page, config)
-    keyboard = _build_keyboard(page, total_pages, has_tasks)
+    keyboard = _build_keyboard(page, total_pages, has_tasks, _status_is_owner.get(chat_id, False))
     try:
         return await message.reply_text(text, parse_mode=enums.ParseMode.HTML, reply_markup=keyboard)
     except Exception as e:
@@ -238,7 +246,7 @@ async def _send_status(client, message, task_queue, chat_id, config, page=0) -> 
 
 async def show_status(client, message, task_queue, chat_id, config, page=0, is_callback=False):
     text, total_pages, has_tasks = _build_status_content(task_queue, chat_id, page, config)
-    keyboard = _build_keyboard(page, total_pages, has_tasks)
+    keyboard = _build_keyboard(page, total_pages, has_tasks, _status_is_owner.get(chat_id, False))
 
     if is_callback:
         if _last_content.get(chat_id) == text:
@@ -257,12 +265,8 @@ async def show_status(client, message, task_queue, chat_id, config, page=0, is_c
 
 
 def _build_status_content(task_queue, chat_id: int, page: int, config) -> tuple[str, int, bool]:
-    # Scope to tasks queued from THIS chat. Without this, every group shares
-    # one global view and sees every other group's (and every DM user's)
-    # tasks mixed together, which is what made /status look like it was
-    # "hallucinating" unrelated or stale tasks.
     all_active = []
-    all_active_ids_global = set()  # every chat, so we don't wipe another chat's progress cache below
+    all_active_ids_global = set()  
     for tid in list(task_queue.queue):
         task = task_queue.get_task(tid)
         if task and task.get("status") in _ACTIVE_STATUSES:
@@ -285,10 +289,10 @@ def _build_status_content(task_queue, chat_id: int, page: int, config) -> tuple[
         queue_pos = task_queue.get_queue_position(task["task_id"])
         lines.append(_build_task_block(queue_pos, task, config))
         if i < len(page_tasks) - 1:
-            lines.append("▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁")
+            lines.append("────────────────")
 
     if not all_active:
-        lines.append("✅ No tasks in queue.\n")
+        lines.append("<i>No tasks in queue.</i>\n")
 
     cpu      = psutil.cpu_percent(interval=None)
     mem      = psutil.virtual_memory()
@@ -297,10 +301,11 @@ def _build_status_content(task_queue, chat_id: int, page: int, config) -> tuple[
     uptime   = _fmt_uptime(int(time.time() - BOT_START_TIME))
 
     lines.append(
-        f"\n<b>⌬ Bot Stats</b>\n"
-        f"┠ Tasks: {len(all_active)}\n"
-        f"┠ CPU: {cpu:.1f}%  Disk: {disk_pct:.1f}%\n"
-        f"┖ RAM: {mem.percent:.1f}%  Uptime: {uptime}"
+        f"\n────────────────\n"
+        f"\n<b>▸ Bot Stats</b>\n"
+        f"┠ Tasks : <code>{len(all_active)}</code>\n"
+        f"┠ CPU : <code>{cpu:.1f}%</code>  Disk : <code>{disk_pct:.1f}%</code>\n"
+        f"┖ RAM : <code>{mem.percent:.1f}%</code>  Uptime : <code>{uptime}</code>"
     )
 
     return "\n".join(lines), total_pages, bool(all_active)
@@ -323,33 +328,33 @@ def _build_task_block(queue_pos: int, task: dict, config) -> str:
     status_label = _build_status_label(task)
     pct, speed_str, eta_str = _build_progress_info(task)
 
-    title = "Task 0 (Running)" if queue_pos == 0 else f"Task {queue_pos}"
-    b  = f"<b>{title}</b>\n"
-    b += f"┃ File: <code>{escape(str(filename))}</code>\n"
-    b += f"┃ Size: {size_str}\n"
+    title = "Task 0" if queue_pos == 0 else f"Task {queue_pos}"
+    b  = f"<b>▸ {title}</b>\n"
+    b += f"┃ File : <code>{escape(str(filename))}</code>\n"
+    b += f"┃ Size : <code>{size_str}</code>\n"
     if task.get("task_type") == "rename":
         watermark_on = bool((task.get("watermark") or {}).get("enabled"))
-        b += f"┠ Watermark : {'On' if watermark_on else 'Off'}\n"
+        b += f"┠ Watermark : <b>{'On' if watermark_on else 'Off'}</b>\n"
     else:
         b += f"┠ Resolution : {res_line}\n"
-    b += f"┠ Status : {status_label}\n"
+    b += f"┠ Status : <i>{status_label}</i>\n"
 
     if pct is not None:
-        b += f"┠ {_progress_bar(pct)}\n"
+        b += f"┠ <code>{_progress_bar(pct)}</code>\n"
 
     if speed_str or eta_str:
         parts = []
-        if speed_str: parts.append(f"Speed: {speed_str}")
-        if eta_str:   parts.append(f"ETA: {eta_str}")
+        if speed_str: parts.append(f"Speed: <code>{speed_str}</code>")
+        if eta_str:   parts.append(f"ETA: <code>{eta_str}</code>")
         b += f"┠ {' | '.join(parts)}\n"
 
     dc = task.get("dc")
     if dc:
-        b += f"┠ DC: DC{dc}\n"
+        b += f"┠ DC : <code>DC{dc}</code>\n"
 
-    b += f"┠ Elapsed: {_elapsed_for_task(task)}\n"
-    b += f"┠ User: {user_str}\n"
-    b += f"┠ ID: <code>{escape(str(task.get('user_id', '?')))}</code>\n"
+    b += f"┠ Elapsed : <code>{_elapsed_for_task(task)}</code>\n"
+    b += f"┠ User : {user_str}\n"
+    b += f"┠ ID : <code>{escape(str(task.get('user_id', '?')))}</code>\n"
     b += f"┖ <code>{command_text(config, 'cancel')} {escape(str(task_id[:8]))}</code>"
     return b
 

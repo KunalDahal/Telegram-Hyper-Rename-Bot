@@ -22,7 +22,11 @@ def admin_only(func: Callable) -> Callable:
         user_id = message.from_user.id
         owner_ids = get_owner_ids()
         if user_id not in owner_ids:
-            await message.reply_text("❌ You are not authorized to use this command.")
+            await message.reply_text(
+                "<b>▸ Access Denied</b>\n"
+                "────────────────\n"
+                "<i>You are not authorized to use this command.</i>"
+            )
             return
         return await func(client, message, *args, **kwargs)
     return wrapper

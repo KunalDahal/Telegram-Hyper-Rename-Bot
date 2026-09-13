@@ -1,12 +1,16 @@
 import asyncio
 import os
+import re
 import shutil
 import time
 import logging
 from copy import deepcopy
+from html import escape, unescape
 
-from pyrogram import Client
+from pyrogram import Client, enums
+from PIL import Image
 
+from src.core.user_setting import DEFAULT_CAPTION_TEMPLATE
 from src.services.downloader import Downloader
 from src.services.media_processor import MediaProcessor
 from src.services.uploader import Uploader
@@ -32,35 +36,22 @@ class Worker:
         self.helper_loads = helper_loads or {}
         self._premium_download_client: Client | None = None
         self._retired_download_clients: list[Client] = []
-        # Fingerprint of the SESSION_STRING the current premium client was
-        # built from. `__main__.py` and `Worker.start()` both call
-        # `configure_premium_download_session()` on startup; now that the
-        # session is file-backed (see session_persistence.py) instead of
-        # in-memory, letting that redundant second call spin up another
-        # Client on the *same* on-disk session file would mean two
-        # concurrent sqlite connections to one file -- so a repeat call
-        # with an unchanged SESSION_STRING becomes a no-op below.
         self._premium_session_fingerprint: str | None = None
 
-        # Bot-side dump. This belongs exclusively to BOT_TOKEN.
         self._dump_chat_id: int | None = None
 
-        # Premium-side view of the same dump channel. This is only populated
-        # when SESSION_STRING is configured and DUMP_CHAT_ID is resolved.
         self._premium_dump_chat_id: int | None = None
+
+        self._premium_extra_dump_chat_id: int | None = None
+
+        self._premium_dump_can_write: bool | None = None
+        self._premium_extra_dump_can_write: bool | None = None
         self.config = config
         self.media_processor = MediaProcessor(config.paths.ffmpeg)
         self.temp_base = config.paths.tmp
         self.thumbnails_dir = config.paths.thumbnails
         self.running = False
 
-        # WORKERS is the single concurrency knob for the whole bot: it is
-        # the number of complete job lifecycles admitted to the global pool
-        # AND the cap for each stage (download, upload, watermark
-        # processing). Premium and normal tasks share the same pool, so
-        # e.g. WORKERS=4 means at most 4 jobs total (premium + normal
-        # combined), at most 4 downloads at a time, and at most 4 uploads
-        # at a time -- never more than that.
         configured_workers = getattr(
             config, "workers", getattr(config, "max_rename_at_once", MAX_PIPELINE_SLOTS)
         )
@@ -72,8 +63,6 @@ class Worker:
         self.watermark_limit = self.workers
 
         self._download_slot = asyncio.Semaphore(self.download_limit)
-        # Premium and normal uploads share one pool-sized semaphore -- see
-        # the WORKERS comment above; there's no separate premium cap.
         self._upload_slot = asyncio.Semaphore(self.upload_limit)
         self._watermark_processing_slot = asyncio.Semaphore(self.watermark_limit)
         logger.info(
@@ -87,20 +76,8 @@ class Worker:
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._pool_worker_tasks: list[asyncio.Task] = []
         self._uploading_task_ids: set[str] = set()
-        # Delivery (dump -> user copy_message) now runs as its own follow-up
-        # task instead of blocking a pool worker slot for the whole
-        # copy_message() round trip -- see _spawn_delivery()/_finalize_delivery().
         self._delivery_tasks: dict[str, asyncio.Task] = {}
 
-        # Multiple pool workers can pick up tasks from the same source
-        # channel within milliseconds of each other (a typical batch
-        # rename). The FIRST forward_messages()/get_chat() call against a
-        # chat the client hasn't seen yet triggers Telegram's peer
-        # resolution (GetChannels); if several workers fire that call
-        # concurrently before the first one finishes caching the peer, the
-        # others get a spurious CHANNEL_INVALID even though the chat is
-        # perfectly valid. These per-chat locks make concurrent tasks wait
-        # for the first resolution instead of racing it.
         self._peer_resolve_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
         self._ensure_runtime_directories()
@@ -116,21 +93,6 @@ class Worker:
     async def _ensure_peer_resolved(
         self, client: Client, chat_id, chat_username: str | None = None
     ) -> None:
-        """Warm a client's peer cache for chat_id, serialized so concurrent
-        tasks don't race Telegram's first-time GetChannels resolution.
-
-        If plain resolution fails, this also tries to actually get
-        `client` INTO the chat -- not just look it up -- since a client
-        that has never been a member (typically the Premium session on a
-        chat only the bot account has been active in) can't resolve a
-        bare numeric ID at all: Telegram requires a username or invite
-        link to join, and without joining there's no access_hash to be
-        had. `chat_username` (captured at task-creation time from the
-        source chat, if it's public) is what makes that possible; for a
-        private chat with no username, we try to have `self.client` (the
-        bot) mint an invite link, since it's normally already active/
-        admin in whatever chat the source message came from.
-        """
         lock = self._peer_lock(client, chat_id)
         async with lock:
             try:
@@ -154,10 +116,6 @@ class Worker:
                         getattr(client, "name", "client"), chat_id, joined_via,
                     )
             except Exception:
-                # Resolution failure here isn't fatal on its own -- the
-                # caller's real operation (forward_messages, etc.) will
-                # raise its own, more specific error if the chat truly
-                # can't be reached. This is best-effort cache warming.
                 logger.debug(
                     "[Worker] Peer warm-up get_chat(%s) still failing after "
                     "a join attempt; letting the caller's own call surface "
@@ -168,13 +126,6 @@ class Worker:
     async def _try_join_source_chat(
         self, client: Client, chat_id, chat_username: str | None
     ) -> str | None:
-        """Best-effort: get `client` into `chat_id` so it can resolve it.
-
-        Returns a short description of how it joined on success, or None
-        if no join was possible/needed with the information available.
-        Never raises -- this is a fallback path, and the caller always
-        re-attempts `get_chat()` afterward regardless of the outcome here.
-        """
         if chat_username:
             try:
                 await client.join_chat(chat_username)
@@ -185,9 +136,6 @@ class Worker:
                     chat_username, chat_id, exc_info=True,
                 )
 
-        # No public username: see if the bot side (which the source
-        # message came through, and is normally already active/admin
-        # there) can mint an invite link for the Premium session to use.
         if client is not self.client:
             try:
                 invite = await self.client.export_chat_invite_link(chat_id)
@@ -219,28 +167,6 @@ class Worker:
     async def _ensure_user_peer_resolved(
         self, client: Client, user_id: int, username: str | None
     ) -> None:
-        """Warm `client`'s peer cache for `user_id` before it DMs them.
-
-        The bot client never needs this: a user necessarily already
-        messaged the bot to create the task, so the bot's peer cache is
-        always warm for them. The Premium session is different -- it's
-        only ever used for files >2 GiB, and it typically has *no* prior
-        interaction with the requesting user at all (no shared dialog, no
-        mutual contact). Telegram then rejects a bare numeric chat_id with
-        PEER_ID_INVALID ("make sure you meet the peer before interacting
-        with it"), because the client has no access_hash for that peer.
-
-        Resolving by @username (captured at task-creation time) gives the
-        client a real, non-"min" access_hash it can use afterward. This is
-        the same trick Telegram clients use internally: `users.getUsers`/
-        `contacts.resolveUsername` by public username always works,
-        regardless of prior contact. If the user has no public username,
-        there is no automatic fix -- Telegram requires the Premium
-        account to have *some* prior visibility into that user (they'd
-        need to start a chat with the Premium account once) before it can
-        message them. That limitation is surfaced via a clear error
-        instead of a raw PEER_ID_INVALID further down the call stack.
-        """
         if client is self.client:
             return
 
@@ -280,14 +206,8 @@ class Worker:
         self.running = True
         self._startup_cleanup()
 
-        # The bot dump is always initialized first because it is the final
-        # delivery staging area. Premium uploads are copied into this dump
-        # before BOT_TOKEN sends them to the user.
         await self._initialize_dump_chat()
 
-        # Initialize the optional Premium user session BEFORE accepting any
-        # queued work. This makes SESSION_STRING effective without requiring
-        # application code to remember a second initialization call.
         session_string = str(getattr(self.config, "session_string", "") or "").strip()
         if session_string:
             await self.configure_premium_download_session(session_string)
@@ -326,11 +246,6 @@ class Worker:
         return self._premium_download_client is not None
 
     async def configure_premium_download_session(self, session_string: str):
-        """Configure the optional Premium user session.
-
-        BOT_TOKEN remains responsible for normal bot operations and the
-        bot-side dump. DUMP_CHAT_ID is used only by this Premium user session.
-        """
         session_string = (session_string or "").strip()
         if not session_string:
             raise ValueError("SESSION_STRING is empty.")
@@ -341,10 +256,6 @@ class Worker:
             and self._premium_session_fingerprint == new_fingerprint
             and self._premium_download_client.is_connected
         ):
-            # Redundant call with the same credential (this legitimately
-            # happens once at startup -- see the comment in __init__).
-            # The existing client already owns the on-disk session file;
-            # don't open a second connection to it.
             logger.debug(
                 "[Worker] configure_premium_download_session() called again "
                 "with an unchanged SESSION_STRING; reusing the existing "
@@ -352,9 +263,6 @@ class Worker:
             )
             return await self._premium_download_client.get_me()
 
-        # Premium uploads go directly to the bot-visible dump. This is the
-        # canonical staging chat because BOT_TOKEN must later copy the message
-        # into the user's DM. DUMP_CHAT_ID remains a fallback for old configs.
         premium_dump_target = getattr(self.config, "bot_dump_chat_id", None)
         if not premium_dump_target:
             premium_dump_target = getattr(self.config, "dump_chat_id", None)
@@ -362,15 +270,6 @@ class Worker:
             raise ValueError(
                 "BOT_DUMP_CHAT_ID (or DUMP_CHAT_ID) is required when SESSION_STRING is configured."
             )
-
-        # As with the bot Client: passing `session_string` to the
-        # constructor forces MemoryStorage regardless of `in_memory`, so
-        # this client's peer cache -- the access-hash table forward_messages
-        # depends on to reach a source channel -- was wiped on every
-        # restart. Materialize a persistent on-disk session from
-        # SESSION_STRING once, then start the real Client on that file
-        # (no `session_string=`) so peers resolved during this run are
-        # written straight to disk and survive the next restart.
         premium_session_dir = self.config.paths.logs
         await ensure_persistent_session(
             "premium_download_session", premium_session_dir, session_string
@@ -381,10 +280,7 @@ class Worker:
             api_hash=self.config.api_hash,
             workdir=premium_session_dir,
             in_memory=False,
-            # Same reasoning as the bot Client: this is a single shared cap
-            # for downloads AND uploads on this session, so it must cover
-            # both stages running at once (WORKERS each), not just one.
-            max_concurrent_transmissions=self.workers * 2,
+            max_concurrent_transmissions=self.config.upload_part_workers,
             no_updates=True,
         )
 
@@ -406,6 +302,42 @@ class Worker:
                 candidate,
                 str(premium_dump_target),
             )
+            self._premium_dump_can_write = await self._verify_can_write(
+                candidate, premium_dump_id, "BOT_DUMP_CHAT_ID"
+            )
+
+            extra_dump_target = getattr(self.config, "dump_chat_id", None)
+            if extra_dump_target and str(extra_dump_target) != str(premium_dump_target):
+                try:
+                    self._premium_extra_dump_chat_id = await self._prepare_dump_chat(
+                        candidate, str(extra_dump_target)
+                    )
+                    logger.info(
+                        "[Worker] Premium session also joined DUMP_CHAT_ID=%s "
+                        "(chat_id=%s).",
+                        extra_dump_target, self._premium_extra_dump_chat_id,
+                    )
+                    self._premium_extra_dump_can_write = await self._verify_can_write(
+                        candidate, self._premium_extra_dump_chat_id, "DUMP_CHAT_ID"
+                    )
+                except Exception as exc:
+                    self._premium_extra_dump_chat_id = None
+                    self._premium_extra_dump_can_write = None
+                    logger.warning(
+                        "[Worker] Premium session could not join "
+                        "DUMP_CHAT_ID=%r (non-fatal): %s",
+                        extra_dump_target, exc,
+                    )
+
+            if not self._premium_dump_can_write and not self._premium_extra_dump_can_write:
+                logger.error(
+                    "[Worker] Premium session has no confirmed-writable dump "
+                    "chat (BOT_DUMP_CHAT_ID writable=%s, DUMP_CHAT_ID "
+                    "writable=%s). Premium deliveries will likely fail with "
+                    "CHAT_WRITE_FORBIDDEN until the account is granted "
+                    "posting rights in one of these chats.",
+                    self._premium_dump_can_write, self._premium_extra_dump_can_write,
+                )
 
         except Exception:
             try:
@@ -430,12 +362,26 @@ class Worker:
         )
         return account
 
-    async def _prepare_dump_chat(self, client: Client, configured_chat: str) -> int:
-        """Resolve the Premium-side dump target.
+    async def _verify_can_write(self, client: Client, chat_id: int, label: str) -> bool:
+        try:
+            await client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
+            logger.info(
+                "[Worker] Premium session confirmed writable: %s (chat_id=%s).",
+                label, chat_id,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[Worker] Premium session joined %s (chat_id=%s) but CANNOT "
+                "post there: %s. Forwards/copies to this chat will fail "
+                "with CHAT_WRITE_FORBIDDEN until the account is given "
+                "posting rights (e.g. made an admin with post permission, "
+                "or the chat's member permissions are relaxed).",
+                label, chat_id, exc,
+            )
+            return False
 
-        A private invite URL can be joined by the user session. A numeric
-        private ID requires the Premium account to already be a member.
-        """
+    async def _prepare_dump_chat(self, client: Client, configured_chat: str) -> int:
         target = (configured_chat or "").strip()
         if not target:
             raise ValueError("DUMP_CHAT_ID is empty.")
@@ -479,6 +425,9 @@ class Worker:
         self._premium_download_client = None
         self._retired_download_clients.clear()
         self._premium_dump_chat_id = None
+        self._premium_extra_dump_chat_id = None
+        self._premium_dump_can_write = None
+        self._premium_extra_dump_can_write = None
         self.download_client = self.client
         for client in clients:
             if not client:
@@ -489,7 +438,6 @@ class Worker:
                 logger.warning("Could not stop Premium download session cleanly.")
 
     async def clear_for_restart(self) -> None:
-        """Cancel all work and remove only task scratch data before a clean restart."""
         await self.stop()
         if os.path.isdir(self.temp_base):
             for name in os.listdir(self.temp_base):
@@ -508,8 +456,6 @@ class Worker:
                     shutil.rmtree(folder, ignore_errors=True)
 
     async def _worker_loop(self):
-        # Pool workers block on the same pending queue. Each worker owns one
-        # complete task until its upload and delivery finish.
         while self.running:
             await asyncio.sleep(0.25)
 
@@ -537,10 +483,8 @@ class Worker:
                     active.cancel()
                 raise
             except Exception:
-                # _run_pipeline_task handles task failure and user notification.
                 pass
 
-    # ── Bounded transfer pipeline ────────────────────────────────────────────
 
     def _refresh_current_task(self):
         self.task_queue.current_task = next(iter(self._active_tasks), None)
@@ -551,25 +495,12 @@ class Worker:
         return bool(watermark.get("enabled") and str(watermark.get("text", "")).strip())
 
     def _uses_premium_download(self, task: dict) -> bool:
-        # Kept for compatibility with callers, but download routing is never
-        # selected from file size. HyperTG is the single download path.
         return False
 
     def _uses_premium_dump(self, task: dict) -> bool:
         return False
 
     async def _resolve_bot_dump_chat(self, configured_chat: str):
-        """Resolve BOT_DUMP_CHAT_ID using the bot session.
-
-        Accepted targets:
-        - numeric -100... chat ID
-        - public @username
-        - Telegram private invite URL
-
-        For an invite URL, get_chat() is attempted first. If the bot has not
-        joined yet, join_chat() is attempted. Pyrogram documents join_chat()
-        as usable by bots and accepts t.me invite links.
-        """
         target = (configured_chat or "").strip()
 
         logger.info(
@@ -595,8 +526,6 @@ class Worker:
             logger.exception("[Bot Dump] Could not retrieve bot identity.")
             raise
 
-        # 1. Try direct resolution first. This works for numeric IDs,
-        # usernames, and invite links when the bot already has access.
         try:
             logger.info(
                 "[Bot Dump] Step 1: get_chat(%r)",
@@ -615,8 +544,6 @@ class Worker:
             )
 
             if chat and getattr(chat, "id", None):
-                # A ChatPreview means the bot can see the target but may not
-                # have joined yet. For invite links, attempt to join.
                 if chat.__class__.__name__ != "ChatPreview":
                     return chat
 
@@ -637,7 +564,6 @@ class Worker:
                 exc_info=True,
             )
 
-        # 2. Invite-link path.
         if (
             "t.me/+" in target
             or "telegram.me/+" in target
@@ -676,14 +602,6 @@ class Worker:
                     f"{exc}"
                 ) from exc
 
-        # 3. Numeric ID: Pyrogram can only build a peer reference for a bare
-        # ID if it already has that chat's access_hash cached from a prior
-        # interaction (a message/update the bot has seen). A bot that was
-        # only added as admin, without ever receiving anything from that
-        # chat, has no cached peer and get_chat(id) fails even though the
-        # bot genuinely has access. get_dialogs() walks every chat the bot
-        # is a member of and caches each one as a side effect, so it warms
-        # the peer cache without requiring a username or invite link.
         try:
             target_id = int(target)
         except ValueError:
@@ -726,11 +644,6 @@ class Worker:
         )
 
     async def _initialize_dump_chat(self) -> None:
-        """Initialize the mandatory BOT_TOKEN-side dump.
-
-        DUMP_CHAT_ID is deliberately not read here. It belongs only to the
-        optional Premium SESSION_STRING client.
-        """
         bot_target = getattr(self.config, "bot_dump_chat_id", None)
 
         if not bot_target:
@@ -771,8 +684,6 @@ class Worker:
                 status,
             )
         except Exception:
-            # The peer itself has already been resolved. A membership-status
-            # lookup failure should not be reported as PEER_ID_INVALID.
             logger.info(
                 "[Worker] Bot dump resolved: %s",
                 self._dump_chat_id,
@@ -795,15 +706,7 @@ class Worker:
 
         file_size = int(task.get("file_size", 0) or 0)
 
-        # The pipeline has ONE download implementation: HyperTG.  The dump is
-        # only the staging transport immediately before it.  Normal-size media
-        # is staged with the bot; oversized media must be staged with the
-        # Premium user session because the bot cannot upload a >2 GiB message.
-        # This keeps download logic completely independent of the 2 GiB limit.
         if file_size > BOT_DOWNLOAD_LIMIT and not self.has_premium_download_session:
-            # There is no legal way for BOT_TOKEN to upload the >2 GiB source
-            # into the dump.  Fall back to the original source message so the
-            # same HyperTG downloader can still download it without Premium.
             logger.warning(
                 "[Worker] No Premium staging session for >2 GiB task %s; "
                 "downloading the original source directly with HyperTG.",
@@ -818,13 +721,6 @@ class Worker:
         )
         stage_chat_id = self._dump_chat_id
 
-        # Warm/serialize peer resolution for the SOURCE chat before
-        # forwarding. Without this, several pool workers picking up files
-        # from the same never-before-seen source channel at once can race
-        # Telegram's first GetChannels lookup and get a transient
-        # CHANNEL_INVALID even though the channel is fine. This also
-        # covers a client (typically the Premium session) that has never
-        # been a member of the source chat at all: see _try_join_source_chat.
         await self._ensure_peer_resolved(stage_client, source_chat_id, source_chat_username)
 
         try:
@@ -838,12 +734,6 @@ class Worker:
             )
         except Exception as exc:
             if "CHANNEL_INVALID" in str(exc) or "PEER_ID_INVALID" in str(exc):
-                # One more attempt: force a fresh peer lookup (bypassing the
-                # lock's "someone already tried" shortcut isn't needed here
-                # since the lock has already been released and re-acquired)
-                # and retry the forward once. This clears the rare case
-                # where the first resolution genuinely failed rather than
-                # merely raced.
                 logger.warning(
                     "[Worker] forward_messages hit %s for source_chat_id=%s; "
                     "retrying once after a fresh peer resolution.",
@@ -863,12 +753,6 @@ class Worker:
         if isinstance(forwarded, list):
             forwarded = forwarded[0] if forwarded else None
         if not forwarded or not getattr(forwarded, "id", None):
-            # forward_messages() returned here without raising -- so this
-            # isn't the CHANNEL_INVALID/peer-resolution failure mode above,
-            # it's Telegram accepting the call but handing back nothing to
-            # forward. The most common cause is the source message no
-            # longer existing by the time this task was staged (deleted by
-            # the user, or an auto-delete timer in the source chat).
             logger.error(
                 "[Worker] forward_messages returned no usable message for "
                 "task_id=%s: source_chat_id=%s source_message_id=%s "
@@ -896,16 +780,10 @@ class Worker:
                 return saved_path
 
         file_size = int(task.get("file_size", 0) or 0)
-        # There is intentionally no artificial 4 GiB download guard here.
-        # The downloader will use the available MTProto/HyperTG path and let
-        # Telegram report a genuine source-side limit or access error.
 
-        # Stage into the dump first when the account capability permits it.
-        # This is an upload/staging operation, not a download implementation.
         self.task_queue.update_status(task_id, "staging_to_dump", 0)
         await self._stage_source_to_dump(task)
 
-        # Every file then enters the exact same HyperTG downloader path.
         self.task_queue.update_status(task_id, "waiting_for_download", 0)
         async with self._download_slot:
             self.task_queue.update_status(task_id, "downloading", 0)
@@ -930,14 +808,6 @@ class Worker:
         try:
             self._ensure_runtime_directories()
 
-            # Resume-only path: the previous run of this task already got the
-            # finished file all the way into the dump chat (recorded right
-            # after Uploader.upload() succeeds, see _upload()) but the process
-            # restarted/crashed before the task could be marked "completed".
-            # Re-running the WHOLE pipeline here would re-download, re-process
-            # and re-upload a file that's already sitting in the dump, and
-            # then deliver it to the user a second time. Since the dump
-            # message IDs survive in the checkpoint, just resume delivery.
             if task.get("dump_upload_done") and task.get("dump_message_ids"):
                 logger.info(
                     "[Worker] %s already uploaded to dump before a restart; "
@@ -971,9 +841,6 @@ class Worker:
             self.task_queue.checkpoint(task_id)
 
             self.task_queue.update_status(task_id, "waiting_for_upload", 0)
-            # All uploads (premium or normal, large or small) share the one
-            # WORKERS-sized upload semaphore -- see the WORKERS comment in
-            # Worker.__init__.
             async with self._upload_slot:
                 self._uploading_task_ids.add(task_id)
                 try:
@@ -981,36 +848,21 @@ class Worker:
                 finally:
                     self._uploading_task_ids.discard(task_id)
 
-            # The file is now safely archived in the dump (dump_upload_done +
-            # dump_message_ids are already checkpointed inside _upload()).
-            # Delivering it to the user runs as its own follow-up task rather
-            # than inline here, so this pool worker slot frees up immediately
-            # for the next queued task instead of sitting idle through a
-            # copy_message() round trip.
             self._spawn_delivery(task)
             return
         except asyncio.CancelledError:
             if not self.running:
-                # self.running is flipped to False at the top of stop(), before
-                # it cancels every active task. Reaching this branch means the
-                # BOT PROCESS is shutting down/restarting (SIGTERM, dyno cycle,
-                # redeploy, crash) — the user never asked to cancel anything.
-                # Do NOT archive/notify as "cancelled": that would permanently
-                # delete the Mongo checkpoint this task needs to resume, and
-                # would incorrectly tell the user their task was cancelled.
-                # Leave the checkpoint and any partial download/prepared file
-                # on disk exactly as-is so restore_task() can pick it back up
-                # as "queued" on the next startup.
                 logger.info(
                     "[Worker] Task %s interrupted by shutdown; leaving it for resume.",
                     task_id[:8],
                 )
                 raise
-            # A real user-initiated cancel (via /cancel or the Cancel All
-            # button) goes through cancel_task(), which also cancels this
-            # same asyncio task — that's the only other way to land here
-            # while self.running is still True.
-            await self._notify_user(task["user_id"], f"⚠️ Task `{task_id[:8]}` was cancelled.")
+            await self._notify_user(
+                task["user_id"],
+                f"<b>▸ Task Cancelled</b>\n"
+                f"────────────────\n"
+                f"Task <code>{task_id[:8]}</code> was <u>cancelled</u>.",
+            )
             self.task_queue.remove_task(task_id, final_status="cancelled")
             self._cleanup_task_folder(task_id)
         except Exception as exc:
@@ -1018,7 +870,13 @@ class Worker:
             failure_text = str(exc).strip()
             if len(failure_text) > 300:
                 failure_text = failure_text[-300:]
-            await self._notify_user(task["user_id"], f"❌ Task `{task_id[:8]}` failed.\n{failure_text}")
+            await self._notify_user(
+                task["user_id"],
+                f"<b>▸ Task Failed</b>\n"
+                f"────────────────\n"
+                f"Task <code>{task_id[:8]}</code> failed.\n"
+                f"<code>{failure_text}</code>",
+            )
             self.task_queue.remove_task(task_id, final_status="failed", error=str(exc))
             self._cleanup_task_folder(task_id)
         finally:
@@ -1029,6 +887,12 @@ class Worker:
     async def _prepare_upload_file(self, task: dict, downloaded_path: str, job: dict) -> str:
         metadata     = job.get("metadata") or task.get("metadata", {})
         watermark    = task.get("watermark", {})
+        # `watermark` on the task is pure styling configuration (enabled,
+        # text, color, timing, position); the actual font file it depends on
+        # lives in task_assets. Older persisted tasks may still carry the
+        # font path embedded in `watermark` itself, hence the fallback.
+        task_assets  = task.get("task_assets") or {}
+        watermark_font_path = task_assets.get("watermark_font_path") or watermark.get("font_path", "")
         has_metadata = any(str(v).strip() for v in metadata.values())
         has_watermark = bool(watermark.get("enabled") and str(watermark.get("text", "")).strip())
         if not has_metadata and not has_watermark:
@@ -1054,7 +918,7 @@ class Worker:
                 input_path=downloaded_path,
                 output_path=output_path,
                 metadata=metadata,
-                watermark=watermark,
+                watermark={**watermark, "font_path": watermark_font_path},
             )
         except Exception:
             logger.exception("[Worker] %s media processing failed", task_id[:8])
@@ -1107,22 +971,12 @@ class Worker:
                 "BOT_DUMP_CHAT_ID could not be resolved for the bot session."
             )
 
-        # Upload routing must be based on the ACTUAL prepared output size, not
-        # the original source size. Processing can make the output larger or
-        # smaller than the source file.
         actual_upload_size = os.path.getsize(file_path)
-        # Premium is selected only for files above the bot's 2 GiB single-
-        # message ceiling and only when a real Premium SESSION_STRING client
-        # is available. Otherwise the upload is performed by the bot in
-        # multiple FFmpeg-created parts.
         use_premium_dump = (
             actual_upload_size > BOT_DOWNLOAD_LIMIT and self.has_premium_download_session
         )
 
         if use_premium_dump:
-            # The Premium account performs the large-file upload, but the
-            # destination is the bot-visible dump so BOT_TOKEN can copy the
-            # resulting message to the user's DM.
             upload_client = self._premium_download_client
             upload_chat_id = self._dump_chat_id
         else:
@@ -1131,10 +985,6 @@ class Worker:
 
         output_filename = job["output_filename"]
 
-        # User-requested policy:
-        #   bot/no Premium: >1.95 GiB => FFmpeg parts of <=1.95 GiB
-        #   Premium session: >3.95 GiB => FFmpeg parts of <=3.95 GiB
-        # Files at or below the applicable threshold are uploaded whole.
         if use_premium_dump and actual_upload_size <= PREMIUM_PART_SIZE:
             upload_parts = [(file_path, output_filename)]
         elif (not use_premium_dump) and actual_upload_size <= BOT_PART_SIZE:
@@ -1145,6 +995,12 @@ class Worker:
                 task, file_path, output_filename, max_part_size
             )
 
+        # Resolve the thumbnail once per task, not once per part: auto-detect
+        # downloads and normalization are both potentially expensive/flaky,
+        # and every part of a given upload must use the same thumbnail asset
+        # for a deterministic result regardless of how many parts there are.
+        resolved_thumbnail_path = await self._resolve_thumbnail(task, job)
+
         results = []
         for part_path, part_name in upload_parts:
             upload_data = {
@@ -1152,7 +1008,7 @@ class Worker:
                 "upload_file_path": part_path,
                 "output_filename": part_name,
                 "send_type": job.get("send_type", "media"),
-                "thumbnail_path": await self._resolve_thumbnail(task, job),
+                "thumbnail_path": resolved_thumbnail_path,
                 "upload_chat_id": upload_chat_id,
             }
 
@@ -1170,30 +1026,14 @@ class Worker:
                     f"Upload returned no dump message for {part_name}."
                 )
 
-            # Both bot and Premium uploads now land in BOT_DUMP_CHAT_ID.
-            # The returned message IDs are therefore directly copyable.
             results.extend(part_results)
 
-        # Persist the dump message IDs BEFORE attempting final delivery, and
-        # remember whether the Premium session put them there. If the process
-        # crashes/restarts anywhere after this point, _run_pipeline_task's
-        # resume path (see above) will re-enter here without re-downloading,
-        # re-processing, or re-uploading anything.
         task["dump_message_ids"] = [r.id for r in results]
         task["dump_upload_done"] = True
         task["dump_used_premium"] = use_premium_dump
         self.task_queue.checkpoint(task_id)
 
     def _spawn_delivery(self, task: dict) -> None:
-        """Kick off dump -> user delivery as an independent follow-up task.
-
-        Upload to the dump has already finished and is checkpointed
-        (dump_upload_done/dump_message_ids), so the pipeline slot this task
-        was using can be released right away -- delivery (copy_message to the
-        user) runs concurrently instead of holding that slot for its round
-        trip. The task moves to "forwarding" here and only becomes
-        "completed" once _finalize_delivery() actually gets it to the user.
-        """
         task_id = task["task_id"]
         self.task_queue.update_status(task_id, "forwarding", 0)
         delivery_task = asyncio.create_task(self._finalize_delivery(task))
@@ -1209,12 +1049,6 @@ class Worker:
             self.task_queue.remove_task(task_id, final_status="completed")
             self._cleanup_task_folder(task_id)
         except asyncio.CancelledError:
-            # Shutdown/user-cancel mid-delivery. The file is already safely
-            # in the dump, so leave the checkpoint (dump_upload_done +
-            # dump_message_ids) as-is rather than losing it -- the resume
-            # branch in _run_pipeline_task picks delivery back up on the
-            # next startup. cancel_task() handles the user-cancel case's
-            # own cleanup/notification itself.
             raise
         except Exception as exc:
             logger.exception("[Worker] Delivery failed for task %s", task_id[:8])
@@ -1222,24 +1056,16 @@ class Worker:
             if len(failure_text) > 300:
                 failure_text = failure_text[-300:]
             await self._notify_user(
-                task["user_id"], f"❌ Task `{task_id[:8]}` failed.\n{failure_text}"
+                task["user_id"],
+                f"<b>▸ Delivery Failed</b>\n"
+                f"────────────────\n"
+                f"Task <code>{task_id[:8]}</code> failed.\n"
+                f"<code>{failure_text}</code>",
             )
             self.task_queue.remove_task(task_id, final_status="failed", error=str(exc))
             self._cleanup_task_folder(task_id)
 
     async def _deliver_dump_messages(self, task: dict) -> None:
-        """Copy/re-send every staged dump message to the user's DM.
-
-        Large (>2 GiB) files were uploaded to the dump by the Premium
-        session, and a bot token cannot send or copy files above that size —
-        that's why 4 GiB tasks used to get stuck at this exact step. Delivery
-        for those must go through the Premium client too; the bot only
-        handles delivery for files it could have uploaded itself.
-
-        Already-delivered parts (tracked in task["delivered_message_ids"])
-        are skipped, so resuming after a restart never re-sends a part that
-        made it through before the crash.
-        """
         task_id = task["task_id"]
         dump_ids: list[int] = task.get("dump_message_ids") or []
         use_premium_dump = bool(task.get("dump_used_premium"))
@@ -1255,10 +1081,6 @@ class Worker:
                 "Reconfigure SESSION_STRING and retry."
             )
 
-        # Must happen before ANY send/history call on deliver_client below --
-        # copy_message, get_chat_history (inside _recently_delivered), and
-        # send_* (inside _resend_media) all fail with PEER_ID_INVALID the
-        # same way if the Premium session has never resolved this user.
         await self._ensure_user_peer_resolved(
             deliver_client, task["user_id"], task.get("username")
         )
@@ -1269,6 +1091,7 @@ class Worker:
 
             source = await self._get_dump_message_with_retry(dump_id)
             source_unique_id = self._media_unique_id(source)
+            caption = self._delivery_caption(task, getattr(source, "caption", None))
 
             delivered_ok = False
             try:
@@ -1277,16 +1100,11 @@ class Worker:
                     chat_id=task["user_id"],
                     from_chat_id=self._dump_chat_id,
                     message_id=dump_id,
-                    caption=self._clean_delivery_caption(getattr(source, "caption", None)),
+                    caption=caption,
+                    parse_mode=enums.ParseMode.HTML,
                 )
                 delivered_ok = True
             except Exception as copy_exc:
-                # copy_message may have actually gone through on Telegram's
-                # side even though the client raised (timeout/connection
-                # reset). Blindly re-sending here is exactly how the same
-                # file ends up in a user's DM twice. Check recent history
-                # for a message with the same file_unique_id before assuming
-                # the copy really failed.
                 logger.warning(
                     "[Worker] copy_message failed for dump message %s: %s; "
                     "checking recent history before falling back.",
@@ -1301,7 +1119,7 @@ class Worker:
                     )
                     delivered_ok = True
                 else:
-                    await self._resend_media(deliver_client, task["user_id"], source)
+                    await self._resend_media(deliver_client, task["user_id"], source, caption)
                     delivered_ok = True
 
             if delivered_ok:
@@ -1310,14 +1128,6 @@ class Worker:
                 self.task_queue.checkpoint(task_id)
 
     async def _get_dump_message_with_retry(self, dump_id: int, attempts: int = 4):
-        """Fetch a just-uploaded dump message, tolerating the brief
-        read-after-write lag that can happen right after Uploader.upload()
-        returns under concurrent load: get_messages() can momentarily come
-        back empty, or return the message before its media attachment has
-        fully synced. A short retry clears this almost every time; a real
-        problem (message truly missing/deleted) still surfaces after the
-        retries are exhausted, via the original error messages.
-        """
         delay = 1.0
         last_empty = False
         for attempt in range(1, attempts + 1):
@@ -1362,22 +1172,35 @@ class Worker:
         return getattr(media, "file_unique_id", "") or ""
 
     @staticmethod
-    def _clean_delivery_caption(dump_caption: str | None) -> str | None:
-        """Strip the internal tracking block (sender name / user ID / task
-        ID) that Uploader adds to dump captions before the file reaches the
-        end user -- they should just see their renamed filename, not
-        delivery bookkeeping meant for the dump chat.
-        """
+    def _dump_filename(dump_caption: str | None) -> str | None:
         if not dump_caption:
+            return None
+        first_line = dump_caption.split("\n\n", 1)[0].strip()
+        first_line = re.sub(r"^<[^>]+>|<[^>]+>$", "", first_line).strip()
+        return unescape(first_line) or None
+
+    def _delivery_caption(self, task: dict, dump_caption: str | None) -> str | None:
+        filename = self._dump_filename(dump_caption)
+        if filename is None:
             return dump_caption
-        return dump_caption.split("\n\n", 1)[0] or dump_caption
+
+        # The caption template is frozen into the task at enqueue time (see
+        # `_build_task` in rename.py) so that a user changing their caption
+        # settings mid-queue can't affect files already queued. `task.get(...)`
+        # returns None only for tasks created before this field existed; those
+        # legacy tasks fall back to the static default template rather than a
+        # live UserSettings lookup, so the worker never re-queries UserSettings
+        # for a task once it has been queued.
+        template = task.get("caption_template")
+        if template is None:
+            template = DEFAULT_CAPTION_TEMPLATE
+
+        if "{filename}" in template:
+            return template.replace("{filename}", filename)
+        return template
 
     @staticmethod
     async def _recently_delivered(client, user_id: int, file_unique_id: str) -> bool:
-        """Best-effort duplicate check: has this exact file already landed
-        in the user's chat recently? Used only to decide whether a re-send
-        fallback is actually needed after an ambiguous copy_message error.
-        """
         try:
             async for msg in client.get_chat_history(user_id, limit=5):
                 media = (
@@ -1392,40 +1215,35 @@ class Worker:
             logger.warning("[Worker] Recent-history duplicate check failed.", exc_info=True)
         return False
 
-    @staticmethod
-    async def _resend_media(client, user_id: int, source) -> None:
-        caption = Worker._clean_delivery_caption(getattr(source, "caption", None))
+    async def _resend_media(self, client, user_id: int, source, caption: str | None) -> None:
         if getattr(source, "video", None):
             await call_with_flood_retry(
                 client.send_video, chat_id=user_id, video=source.video.file_id,
-                caption=caption, supports_streaming=True,
+                caption=caption, parse_mode=enums.ParseMode.HTML, supports_streaming=True,
             )
         elif getattr(source, "document", None):
             await call_with_flood_retry(
                 client.send_document, chat_id=user_id, document=source.document.file_id,
-                caption=caption, force_document=True,
+                caption=caption, parse_mode=enums.ParseMode.HTML, force_document=True,
             )
         elif getattr(source, "audio", None):
             await call_with_flood_retry(
                 client.send_audio, chat_id=user_id, audio=source.audio.file_id, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
             )
         elif getattr(source, "photo", None):
             await call_with_flood_retry(
                 client.send_photo, chat_id=user_id, photo=source.photo.file_id, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
             )
         else:
             raise RuntimeError("Dump message contains no supported media for delivery.")
 
-    # ── Completion message ────────────────────────────────────────────────────
 
     async def _send_completion_to_group(self, task: dict, job: dict, file_path: str):
         source_chat_id = task.get("source_chat_id")
         if not source_chat_id:
             return
-        # The task was queued from the user's own DM (issue: DM support), so
-        # the finished file already lands in the only chat there is. Sending
-        # a second "delivered to your PM" notice into that same DM would just
-        # be a redundant message right above the file itself.
         if source_chat_id == task.get("user_id"):
             return
         text = ""
@@ -1448,23 +1266,30 @@ class Worker:
                 elapsed_str = f"{h}h {r // 60}m {r % 60}s"
 
             text = (
-                f"`{job['output_filename']}`\n"
-                f"┠ **Size:** {size_str}\n"
-                f"┠ **Elapsed:** {elapsed_str}\n"
-                f"➲ File has been Sent to Bot PM (Private)"
+                f"<b>▸ Delivered</b>\n"
+                f"────────────────\n"
+                f"┃ File : <code>{escape(job['output_filename'])}</code>\n"
+                f"┠ Size : <code>{size_str}</code>\n"
+                f"┠ Elapsed : <code>{elapsed_str}</code>\n"
+                f"┖ <i>Sent to your Bot PM (Private)</i>"
             )
 
             await call_with_flood_retry(
                 self.client.send_message,
-                chat_id=source_chat_id, text=text, disable_web_page_preview=True,
+                chat_id=source_chat_id, text=text, parse_mode=enums.ParseMode.HTML,
+                disable_web_page_preview=True,
             )
         except Exception as e:
             logger.warning("[Worker] Completion message failed: %s", e)
 
-    # ── Thumbnail helpers ─────────────────────────────────────────────────────
 
     async def _snapshot_thumbnail(self, task: dict):
-        src = task.get("thumbnail_path", "")
+        # `setdefault` both reads the block created at enqueue time (see
+        # `_build_task` in rename.py) and, for older persisted tasks that
+        # predate task_assets, creates it here so the rest of the pipeline
+        # only ever has one place to look.
+        task_assets = task.setdefault("task_assets", {})
+        src = task_assets.get("thumbnail_path") or task.get("thumbnail_path", "")
         if not src or not os.path.exists(src):
             return
         task_folder = os.path.join(self.temp_base, task["task_id"])
@@ -1474,13 +1299,22 @@ class Worker:
         os.makedirs(task_folder, exist_ok=True)
         try:
             shutil.copy2(src, frozen_path)
-            task["thumbnail_path"] = frozen_path
+            task_assets["thumbnail_path"] = frozen_path
         except Exception as e:
             print(f"[Worker] Thumbnail snapshot failed: {e}")
 
     async def _resolve_thumbnail(self, task: dict, job: dict) -> str | None:
         auto_detect = bool(task.get("auto_detect_thumb", False))
-        user_thumb  = task.get("thumbnail_path") or job.get("thumbnail_path") or ""
+        task_assets = task.get("task_assets") or {}
+        # `task_assets` is the current, authoritative location; the flat
+        # `task`/`job` keys are only read as a fallback for tasks that were
+        # queued (and persisted) before task_assets existed.
+        user_thumb  = (
+            task_assets.get("thumbnail_path")
+            or task.get("thumbnail_path")
+            or job.get("thumbnail_path")
+            or ""
+        )
         task_folder = os.path.join(self.temp_base, task["task_id"])
 
         if not auto_detect:
@@ -1491,65 +1325,78 @@ class Worker:
             os.makedirs(task_folder, exist_ok=True)
             dest = os.path.join(task_folder, "_source_thumb.jpg")
             try:
-                downloaded = await self.client.download_media(source_thumb_id, file_name=dest)
+                downloaded = await call_with_flood_retry(
+                    self.client.download_media, source_thumb_id, file_name=dest,
+                )
                 if downloaded and os.path.exists(downloaded):
                     return await self._normalized_thumbnail(os.path.abspath(downloaded), task_folder)
             except Exception:
-                pass
+                logger.warning(
+                    "[Worker] Auto-detected thumbnail download failed for task %s "
+                    "after retries; falling back to the saved thumbnail.",
+                    task["task_id"][:8], exc_info=True,
+                )
 
         return await self._normalized_thumbnail(user_thumb, task_folder)
 
-    _THUMB_MAX_BYTES = 190 * 1024   # stay under Telegram's 200 KB cap
-    _THUMB_MAX_SIDE  = 320          # Telegram requires both sides <= 320px
+    _THUMB_MAX_BYTES = 190 * 1024
+    _THUMB_MAX_SIDE  = 320
+    _THUMB_MIN_QUALITY = 30
+
+    def _build_normalized_thumbnail(self, path: str, normalized_path: str) -> bool:
+        """Synchronous, CPU-bound Pillow work - run via asyncio.to_thread so it
+        doesn't block the event loop. Returns True only if `normalized_path` was
+        written and satisfies both the max-side and max-byte-size constraints.
+        """
+        try:
+            with Image.open(path) as img:
+                img = img.convert("RGB")
+                img.thumbnail((self._THUMB_MAX_SIDE, self._THUMB_MAX_SIDE), Image.LANCZOS)
+
+                quality = 90
+                while quality >= self._THUMB_MIN_QUALITY:
+                    img.save(normalized_path, "JPEG", quality=quality, optimize=True)
+                    if os.path.getsize(normalized_path) <= self._THUMB_MAX_BYTES:
+                        return True
+                    quality -= 10
+                return False
+        except Exception:
+            logger.warning("[Worker] Thumbnail normalization errored for %s.", path, exc_info=True)
+            return False
 
     async def _normalized_thumbnail(self, path: str, task_folder: str) -> str | None:
-        """Re-encode a thumbnail to what Telegram actually requires.
+        """Return a task-owned thumbnail path that is guaranteed to satisfy
+        Telegram's thumbnail constraints (JPEG, each side <= _THUMB_MAX_SIDE,
+        file size <= _THUMB_MAX_BYTES), or None if no such thumbnail could be
+        produced.
 
-        Telegram silently drops a thumbnail that isn't a JPEG under 200 KB
-        with both dimensions <= 320px, depending on media type and client —
-        which is why a custom/auto-detected thumbnail appears to "not apply"
-        for some files in a batch even though the code picked a valid file
-        path for every one of them. Re-encoding every resolved thumbnail
-        through ffmpeg here makes it always compliant instead of only
-        sometimes, regardless of what the source image actually looked like.
+        This never falls back to returning an unverified/oversized thumbnail:
+        a normalization failure is treated as "no thumbnail for this upload"
+        (explicit, logged) rather than silently handing Telegram something
+        that may be rejected or dropped.
         """
         if not path or not os.path.exists(path):
-            return None
-        try:
-            if os.path.getsize(path) <= self._THUMB_MAX_BYTES:
-                return path
-        except OSError:
             return None
 
         os.makedirs(task_folder, exist_ok=True)
         normalized_path = os.path.join(task_folder, "_thumb_normalized.jpg")
-        cmd = [
-            self.media_processor.ffmpeg_path, "-hide_banner", "-y",
-            "-i", path,
-            "-vf", f"scale='min({self._THUMB_MAX_SIDE},iw)':'min({self._THUMB_MAX_SIDE},ih)':force_original_aspect_ratio=decrease",
-            "-vframes", "1",
-            "-q:v", "4",
-            normalized_path,
-        ]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0 or not os.path.exists(normalized_path):
-                logger.warning(
-                    "[Worker] Thumbnail normalization failed (%s); using original.",
-                    stderr.decode(errors="ignore")[-300:].strip(),
-                )
-                return path
-            return normalized_path
-        except Exception:
-            logger.warning("[Worker] Thumbnail normalization errored; using original.", exc_info=True)
-            return path
 
-    # ── Misc helpers ──────────────────────────────────────────────────────────
+        ok = await asyncio.to_thread(self._build_normalized_thumbnail, path, normalized_path)
+
+        if not ok or not os.path.exists(normalized_path) or os.path.getsize(normalized_path) > self._THUMB_MAX_BYTES:
+            logger.warning(
+                "[Worker] Could not produce a thumbnail for %s within Telegram's "
+                "size/dimension limits; uploading without a thumbnail.", path,
+            )
+            try:
+                if os.path.exists(normalized_path):
+                    os.remove(normalized_path)
+            except OSError:
+                pass
+            return None
+
+        return normalized_path
+
 
     def _cleanup_task_folder(self, task_id: str):
         folder = os.path.join(self.temp_base, task_id)
@@ -1568,16 +1415,18 @@ class Worker:
             return False
 
     def _build_job(self, task: dict) -> dict:
-        # Always build from the task's immutable enqueue-time snapshot. Never
-        # consult the live per-user settings here: another task from the same
-        # user may have changed those settings while this task was queued.
         settings_snapshot = task.get("settings_snapshot") or {}
+        task_assets = task.get("task_assets") or {}
         jobs = task.get("jobs") or []
         job_snapshot = jobs[0] if jobs else {}
         return {
             "output_filename": task["output_filename"],
             "metadata":        deepcopy(settings_snapshot.get("metadata", job_snapshot.get("metadata", {}))),
-            "thumbnail_path":  task.get("thumbnail_path") or job_snapshot.get("thumbnail_path", ""),
+            "thumbnail_path":  (
+                task_assets.get("thumbnail_path")
+                or task.get("thumbnail_path")
+                or job_snapshot.get("thumbnail_path", "")
+            ),
             "send_type":       task.get("send_type") or job_snapshot.get("send_type", settings_snapshot.get("send_type", "media")),
         }
 
@@ -1587,22 +1436,16 @@ class Worker:
         except Exception as e:
             logger.warning("[Worker] Notify failed: %s", e)
 
-    # ── Cancel ────────────────────────────────────────────────────────────────
 
     async def cancel_task(self, task_id: str):
         task = self.task_queue.get_task(task_id)
 
-        # Upload runs inside the task's pool slot, so cancelling the pipeline
-        # task directly also cancels the active Telegram upload.
         active_task = self._active_tasks.get(task_id)
         if active_task and not active_task.done():
             active_task.cancel()
             await asyncio.gather(active_task, return_exceptions=True)
             return
 
-        # By the time a task reaches "forwarding", the pipeline task itself
-        # has already finished (the file is safely uploaded to the dump) and
-        # delivery is running as its own follow-up task -- cancel that instead.
         delivery_task = self._delivery_tasks.get(task_id)
         if delivery_task and not delivery_task.done():
             delivery_task.cancel()
@@ -1612,4 +1455,9 @@ class Worker:
         if task:
             self.task_queue.remove_task(task_id, final_status="cancelled")
             self._cleanup_task_folder(task_id)
-            await self._notify_user(task["user_id"], f"⚠️ Task `{task_id[:8]}` cancelled.")
+            await self._notify_user(
+                task["user_id"],
+                f"<b>▸ Task Cancelled</b>\n"
+                f"────────────────\n"
+                f"Task <code>{task_id[:8]}</code> was <u>cancelled</u>.",
+            )

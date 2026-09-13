@@ -20,8 +20,6 @@ def _parse_allowed_dcs() -> frozenset[int]:
 ALLOWED_DCS: frozenset[int] = _parse_allowed_dcs()
 
 
-# ── DC extraction ─────────────────────────────────────────────────────────────
-
 def get_file_dc(file_id: str) -> int | None:
     try:
         decoded = FileId.decode(file_id)
@@ -33,8 +31,6 @@ def get_file_dc(file_id: str) -> int | None:
     except Exception:
         return None
 
-
-# ── Public gate ───────────────────────────────────────────────────────────────
 
 def is_dc_allowed(file_id: str) -> bool:
     if not ALLOWED_DCS:

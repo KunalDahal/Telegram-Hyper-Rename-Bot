@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime
 from math import ceil, floor
 from mimetypes import guess_extension
@@ -8,7 +9,6 @@ from re import sub
 from sys import argv
 from time import time
 
-from aiofiles import open as aiopen
 from aiofiles.os import makedirs, remove
 from aioshutil import move
 
@@ -215,20 +215,6 @@ class HyperTGDownloader:
         part_count: int,
         max_retries=5,
     ):
-        """Yield exactly the requested byte range using Telegram-safe blocks.
-
-        Telegram's ``upload.getFile`` has strict request geometry: without the
-        ``precise`` flag, offsets and limits must be aligned and each request
-        must stay inside one 1 MiB file fragment. A previous implementation
-        advanced the request offset by the *actual* response length when a short
-        read occurred. That can produce an unaligned offset and immediately
-        trigger ``400 LIMIT_INVALID``.
-
-        We therefore keep request offsets on 1 MiB boundaries. A short response
-        that does not satisfy the portion needed by the current range is retried
-        from the same aligned offset instead of advancing into the middle of a
-        Telegram block. Boundary bytes outside the current part are discarded.
-        """
         index = min(self.work_loads, key=self.work_loads.get)
         client = self.clients[index]
         self.work_loads[index] += 1
@@ -257,10 +243,6 @@ class HyperTGDownloader:
                         self.get_location(file_id),
                     )
 
-                    # Always request a complete 1 MiB-aligned Telegram block.
-                    # The server is allowed to return fewer bytes only at EOF;
-                    # a short non-EOF response must be retried from the same
-                    # offset. Never advance by a short response length.
                     requested = self.chunk_size
                     r = await asyncio.wait_for(
                         media_session.invoke(
@@ -293,8 +275,6 @@ class HyperTGDownloader:
                     needed_end = min(target_end, block_offset + self.chunk_size - 1)
                     eof_reached = block_offset + len(chunk) >= self.file_size
 
-                    # If this block is needed beyond what Telegram returned and
-                    # we are not at EOF, retry exactly the same aligned request.
                     needed_bytes = max(0, needed_end - block_offset + 1)
                     if len(chunk) < needed_bytes and not eof_reached:
                         current_retry += 1
@@ -313,9 +293,6 @@ class HyperTGDownloader:
 
                     current_retry = 0
 
-                    # Keep only the intersection with this part's exact byte
-                    # range. Bytes fetched only to satisfy Telegram's 1 MiB
-                    # request geometry are intentionally discarded.
                     keep_start = max(block_offset, requested_start)
                     keep_end = min(block_end, target_end)
                     if keep_start <= keep_end:
@@ -326,8 +303,6 @@ class HyperTGDownloader:
                             yield kept
                             self._processed_bytes += len(kept)
 
-                    # Advance only to the next Telegram-aligned block. This is
-                    # the critical invariant that prevents LIMIT_INVALID.
                     block_offset += self.chunk_size
 
                 except FloodWait as e:
@@ -384,7 +359,34 @@ class HyperTGDownloader:
             except (asyncio.CancelledError, Exception):
                 break
 
-    async def single_part(self, start, end, part_index, max_retries=5):
+    @staticmethod
+    def _pwrite_all(fd: int, data: bytes, offset: int) -> int:
+        """os.pwrite() is only guaranteed to write *some* of the given bytes in
+        a single call - a short write is permitted by POSIX (e.g. if the call
+        is interrupted) and must not be assumed away. This loops, advancing
+        the offset by however much was actually written each time, until the
+        full buffer has landed.
+        """
+        view = memoryview(data)
+        total = 0
+        while total < len(view):
+            n = os.pwrite(fd, view[total:], offset + total)
+            if n <= 0:
+                raise OSError(
+                    f"pwrite() returned {n} while writing at offset {offset + total}"
+                )
+            total += n
+        return total
+
+    async def single_part(self, fd: int, start: int, end: int, part_index: int, max_retries=5):
+        """Download one byte range and write it straight into its slot in the
+        final file via a positional write (os.pwrite), instead of into its own
+        `.temp.NN` part file. Every part writes to a disjoint byte range of the
+        same fd, so concurrent pwrite calls from different parts never race -
+        there's no shared file offset to contend over. This removes the need
+        for a separate "read every part back and concatenate" pass afterwards:
+        by the time all parts finish, the final file is already complete.
+        """
         until_bytes = min(end, self.file_size - 1)
         from_bytes = start
         offset = from_bytes - (from_bytes % self.chunk_size)
@@ -392,31 +394,26 @@ class HyperTGDownloader:
         last_part_cut = until_bytes % self.chunk_size + 1
         part_count = (until_bytes // self.chunk_size) - (offset // self.chunk_size) + 1
         expected_size = until_bytes - from_bytes + 1
-        part_file_path = ospath.join(
-            self.directory, f"{self.file_name}.temp.{part_index:02d}"
-        )
 
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                # Always overwrite a failed partial part.  Never append to a
-                # previous attempt: get_file() resumes from Telegram offsets
-                # and this file must contain exactly this range once.
-                async with aiopen(part_file_path, "wb") as f:
-                    async for chunk in self.get_file(
-                        offset, first_part_cut, last_part_cut, part_count,
-                    ):
-                        if self._cancel_event.is_set():
-                            raise asyncio.CancelledError("Download cancelled")
-                        await f.write(chunk)
+                written = 0
+                async for chunk in self.get_file(
+                    offset, first_part_cut, last_part_cut, part_count,
+                ):
+                    if self._cancel_event.is_set():
+                        raise asyncio.CancelledError("Download cancelled")
+                    written += await asyncio.to_thread(
+                        self._pwrite_all, fd, chunk, from_bytes + written
+                    )
 
-                actual_size = ospath.getsize(part_file_path)
-                if actual_size != expected_size:
+                if written != expected_size:
                     raise ValueError(
                         f"Part {part_index} size mismatch: expected {expected_size} "
-                        f"bytes, got {actual_size} bytes"
+                        f"bytes, got {written} bytes"
                     )
-                return part_index, part_file_path
+                return part_index
 
             except asyncio.CancelledError:
                 raise
@@ -427,11 +424,10 @@ class HyperTGDownloader:
                     f"(attempt {attempt}/{max_retries}, range={from_bytes}-{until_bytes}): "
                     f"{type(exc).__name__}: {exc}"
                 )
-                try:
-                    if ospath.exists(part_file_path):
-                        await remove(part_file_path)
-                except Exception:
-                    pass
+                # A retried attempt re-downloads the same absolute byte range
+                # from scratch and pwrites over the same offsets, so a partial
+                # write from a failed attempt is simply overwritten with
+                # correct data - no separate rollback is needed.
                 if attempt < max_retries:
                     await asyncio.sleep(min(2 ** attempt, 10))
 
@@ -452,13 +448,6 @@ class HyperTGDownloader:
         num_parts = min(self.num_parts, max(1, self.file_size // (10 * 1024 * 1024)))
         if self.file_size < 10 * 1024 * 1024:
             num_parts = 1
-        # Integer division below almost never divides file_size evenly, so
-        # num_parts * part_size is routinely a few bytes short of file_size
-        # (e.g. 1379281175 // 8 == 172410146, and 8 * 172410146 ==
-        # 1379281168 -- 7 bytes short). The last part's end MUST always be
-        # pinned to file_size - 1 so that remainder always lands in the
-        # final part instead of being silently dropped, which is what
-        # caused "Combined download size mismatch" errors.
         part_size = self.file_size // num_parts if num_parts > 0 else self.file_size
         ranges = [
             (
@@ -469,33 +458,29 @@ class HyperTGDownloader:
             )
             for i in range(num_parts)
         ]
+        fd = None
         tasks = []
         prog_task = None
         try:
+            fd = os.open(temp_file_path, os.O_WRONLY | os.O_CREAT, 0o644)
+            # Preallocate the file at its full final size up front so each part
+            # can pwrite directly into its own slot. There is now only ever one
+            # file on disk for this download - no `.temp.NN` parts to merge
+            # afterwards, so downloading and assembling happen in the same pass.
+            await asyncio.to_thread(os.ftruncate, fd, self.file_size)
+
             for i, (start, end) in enumerate(ranges):
-                tasks.append(asyncio.create_task(self.single_part(start, end, i)))
+                tasks.append(asyncio.create_task(self.single_part(fd, start, end, i)))
             if progress:
                 prog_task = asyncio.create_task(self.progress_callback(progress, progress_args))
-            results = await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks)
             if prog_task and not prog_task.done():
                 prog_task.cancel()
-                # Wait for the progress callback to stop before final assembly.
                 await asyncio.gather(prog_task, return_exceptions=True)
-            async with aiopen(temp_file_path, "wb") as temp_file:
-                for _, part_file_path in sorted(results, key=lambda x: x[0]):
-                    try:
-                        async with aiopen(part_file_path, "rb") as part_file:
-                            while True:
-                                chunk = await part_file.read(8 * 1024 * 1024)
-                                if not chunk:
-                                    break
-                                await temp_file.write(chunk)
-                        await remove(part_file_path)
-                    except Exception as e:
-                        self.logger(
-                            f"Error processing part file {part_file_path}: {e}"
-                        )
-                        raise
+
+            os.close(fd)
+            fd = None
+
             file_path = ospath.splitext(temp_file_path)[0]
             combined_size = ospath.getsize(temp_file_path)
             if combined_size != self.file_size:
@@ -523,15 +508,16 @@ class HyperTGDownloader:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            for i in range(len(ranges)):
-                part_path = ospath.join(
-                    self.directory, f"{self.file_name}.temp.{i:02d}"
-                )
+            if fd is not None:
                 try:
-                    if ospath.exists(part_path):
-                        await remove(part_path)
-                except Exception:
+                    os.close(fd)
+                except OSError:
                     pass
+            try:
+                if ospath.exists(temp_file_path):
+                    await remove(temp_file_path)
+            except Exception:
+                pass
 
     @staticmethod
     async def get_extension(file_type, mime_type):

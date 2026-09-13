@@ -29,7 +29,6 @@ class TaskQueue:
         self.task_store = task_store
 
     def _schedule_store(self, coro) -> None:
-        """Persist asynchronously without blocking Telegram progress callbacks."""
         if not self.task_store:
             return
         try:
@@ -37,7 +36,6 @@ class TaskQueue:
             self._store_jobs.add(job)
             job.add_done_callback(self._store_jobs.discard)
         except RuntimeError:
-            # The bot only mutates this queue while its event loop is running.
             pass
 
     def checkpoint(self, task_id: str) -> None:
@@ -45,10 +43,6 @@ class TaskQueue:
         if not task or not self.task_store:
             return
 
-        # Progress callbacks can schedule checkpoints faster than MongoDB can
-        # complete them. Chain checkpoints for the SAME task so an older state
-        # can never finish after a newer state and overwrite it. Different tasks
-        # remain independent and may persist concurrently.
         snapshot = deepcopy(task)
         previous = self._checkpoint_chains.get(task_id)
 
@@ -57,7 +51,6 @@ class TaskQueue:
                 try:
                     await previous
                 except Exception:
-                    # A failed older checkpoint must not block the newest state.
                     pass
             await self.task_store.save_active(snapshot)
 
@@ -77,7 +70,10 @@ class TaskQueue:
         job.add_done_callback(_done)
 
     def create_task(self, task_data: dict) -> str:
-        task_id = uuid.uuid4().hex
+        # Callers may hand in a task_id they already reserved (e.g. so they can
+        # freeze task-owned asset files under that id *before* the task exists
+        # in the queue). If none is given, one is generated here as before.
+        task_id = str(task_data.get("task_id") or uuid.uuid4().hex)
         file_id = task_data.get("file_id", "")
         dc      = get_file_dc(file_id) if file_id else None
 
@@ -90,6 +86,7 @@ class TaskQueue:
             "dc":         dc,
         }
         task.update(task_data)
+        task["task_id"] = task_id
         self.tasks[task_id] = task
         self.queue.append(task_id)
         self.pending_queue.append(task_id)
@@ -97,7 +94,6 @@ class TaskQueue:
         return task_id
 
     def restore_task(self, task_data: dict) -> bool:
-        """Restore an unfinished Mongo checkpoint as a queued task."""
         task_id = str(task_data.get("task_id") or "")
         if not task_id or task_id in self.tasks:
             return False
@@ -120,7 +116,6 @@ class TaskQueue:
         return self.tasks.get(task_id)
 
     def pop_next_queued_task(self) -> dict | None:
-        """Pop the next waiting task without scanning the full task list."""
         while self.pending_queue:
             task_id = self.pending_queue.popleft()
             task = self.tasks.get(task_id)
@@ -155,11 +150,21 @@ class TaskQueue:
         self._refresh_processing_flag()
         if task and final_status and self.task_store:
             snapshot = deepcopy(task)
-            pending_writes = list(self._store_jobs)
+            # Each checkpoint() call for a given task_id chains after the
+            # previous one for that same task_id (see checkpoint() above), so
+            # waiting on only the latest chain entry for *this* task_id is
+            # enough to guarantee all of its earlier writes have landed -
+            # there's no need to also wait on unrelated tasks' pending store
+            # jobs, which would otherwise serialize archiving behind whatever
+            # else happens to be in flight across the whole queue.
+            own_pending_checkpoint = self._checkpoint_chains.get(task_id)
 
             async def archive_after_checkpoints() -> None:
-                if pending_writes:
-                    await asyncio.gather(*pending_writes, return_exceptions=True)
+                if own_pending_checkpoint:
+                    try:
+                        await own_pending_checkpoint
+                    except Exception:
+                        pass
                 await self.task_store.archive(snapshot, final_status, error)
 
             self._schedule_store(archive_after_checkpoints())

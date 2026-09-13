@@ -2,6 +2,9 @@ import asyncio
 import os
 import shutil
 import time
+from html import escape
+
+from pyrogram.enums import ParseMode
 
 from src.utils.retry import call_with_flood_retry
 
@@ -31,11 +34,6 @@ class Uploader:
         self._cached_eta = 0
         self._progress_lock = asyncio.Lock()
 
-        # Bytes already accounted for from parts that finished before the
-        # one currently being sent. Kurigram/Pyrogram's progress callback
-        # reports (current, total) for the single file it is transmitting
-        # right now, so this offset is what turns that into an overall
-        # uploaded/total figure across every part of this task.
         self._part_base_bytes = 0
 
         self.upload_progress = {
@@ -54,9 +52,6 @@ class Uploader:
         return MAX_PREMIUM_BYTES if self.user_is_premium else MAX_NON_PREMIUM_BYTES
 
     def _dump_display_name(self) -> str:
-        """Username (preferred, so the master bot / a human can tap through
-        to the sender) or public first_name as a fallback when the user has
-        no @username set."""
         username = str(self.task_data.get("username") or "").strip()
         if username:
             return f"@{username}"
@@ -64,15 +59,14 @@ class Uploader:
         return first_name or "Unknown"
 
     def _dump_caption(self, task_id: str, user_id, part_name: str, part_idx: int, n_parts: int) -> str:
-        """Caption for a message landing in the dump chat."""
         caption = (
-            f"**{part_name}**\n\n"
-            f"👤 **{self._dump_display_name()}**\n"
-            f"🆔 User ID: `{user_id}`\n"
-            f"🔖 Task ID: `{task_id}`"
+            f"<code>{escape(part_name)}</code>\n\n"
+            f"┃ User : <b>{escape(self._dump_display_name())}</b>\n"
+            f"┠ User ID : <code>{user_id}</code>\n"
+            f"┖ Task ID : <code>{task_id}</code>"
         )
         if n_parts > 1:
-            caption += f"\n📦 Part {part_idx} of {n_parts}"
+            caption += f"\n<i>Part {part_idx} of {n_parts}</i>"
         return caption
 
     async def upload(self):
@@ -107,18 +101,7 @@ class Uploader:
         max_part_sz = self._max_part_size()
         thumb = self.task_data.get("thumbnail_path")
 
-        if file_size > max_part_sz:
-            if not self.user_is_premium:
-                raise Exception(
-                    f"Non-Premium upload file is {file_size / (1024**3):.2f} GiB; "
-                    f"maximum per part is {max_part_sz / (1024**3):.2f} GiB."
-                )
 
-        # Telegram's file-part limit is separate from our application-level
-        # split limit. For ordinary files we hand the whole file straight to
-        # Kurigram/Pyrogram's native send_video/send_document, which uploads
-        # it via save_file()'s own concurrent MTProto transmissions. Oversized
-        # application files retain the old FFmpeg-independent split behavior.
         if file_size > max_part_sz:
             parts = await self._split_file(
                 final_file_path, max_part_sz, output_file_name, task_folder
@@ -191,12 +174,6 @@ class Uploader:
         def _on_wait(_delay: int, _attempt: int) -> None:
             self.upload_progress["status"] = "rate_limited"
 
-        # Hand the local path straight to Kurigram/Pyrogram's native
-        # send_document/send_video. They call the client's own save_file()
-        # internally, which performs the real chunking and concurrent
-        # MTProto transmissions (bounded by the Client's
-        # max_concurrent_transmissions) -- no manual SaveBigFilePart/
-        # InputFileBig construction needed here at all.
         if send_type.lower() in ["doc", "document"]:
             return await call_with_flood_retry(
                 self.client.send_document,
@@ -204,6 +181,7 @@ class Uploader:
                 document=part_path,
                 thumb=thumb,
                 caption=caption,
+                parse_mode=ParseMode.HTML,
                 force_document=True,
                 file_name=part_name,
                 progress=self._progress_callback,
@@ -217,6 +195,7 @@ class Uploader:
             video=part_path,
             thumb=thumb,
             caption=caption,
+            parse_mode=ParseMode.HTML,
             file_name=part_name,
             supports_streaming=True,
             progress=self._progress_callback,
@@ -225,10 +204,6 @@ class Uploader:
         )
 
     async def _progress_callback(self, current: int, total: int):
-        # Called directly by Kurigram/Pyrogram's save_file() with the real
-        # upload byte counter for whichever part is transmitting right now,
-        # so the displayed speed always reflects the actual upload callback
-        # values -- nothing here is derived from manually generated chunks.
         now = time.time()
 
         overall_uploaded = min(self._part_base_bytes + current, self._grand_total_bytes)

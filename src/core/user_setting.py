@@ -1,4 +1,3 @@
-"""Per-user rename preferences backed by MongoDB, with legacy JSON migration."""
 
 from __future__ import annotations
 
@@ -49,6 +48,8 @@ DEFAULT_METADATA = {
     "encoder": "",
 }
 
+DEFAULT_CAPTION_TEMPLATE = "<b>{filename}</b>"
+
 
 def _extract_font_name(font_path: str) -> str:
     try:
@@ -72,7 +73,6 @@ def _extract_font_name(font_path: str) -> str:
 
 
 class UserSettings:
-    """Mutable settings object that persists updates to MongoDB immediately."""
 
     _temp_state: Dict[int, Dict] = {}
 
@@ -97,7 +97,6 @@ class UserSettings:
 
     @property
     def temp_state(self) -> Dict[int, Dict]:
-        """Short-lived chat interaction state; intentionally not persisted."""
         return UserSettings._temp_state
 
     def _load_legacy_file(self) -> Dict[str, Any]:
@@ -146,6 +145,8 @@ class UserSettings:
         )
         self.data.setdefault("thumbnail_path", "")
         self.data.setdefault("thumbnail_asset_id", "")
+        self.data["custom_caption"] = str(self.data.get("custom_caption") or "").strip()
+        self.data["caption_disabled"] = self._as_bool(self.data.get("caption_disabled", False))
 
         watermark = self.data.get("watermark")
         if not isinstance(watermark, dict):
@@ -207,7 +208,6 @@ class UserSettings:
 
     @staticmethod
     def _positive_number_string(value: Any) -> str:
-        """Keep valid zero padding while preventing batch-renaming crashes."""
         text = str(value).strip()
         if not text.isdigit() or int(text) < 1:
             return "1"
@@ -236,7 +236,6 @@ class UserSettings:
                 watermark["font_path"] = ""
 
     def _migrate_legacy_assets(self) -> None:
-        """Copy pre-Mongo thumbnail/font files into GridFS on first access."""
         if not self.store:
             return
         thumbnail_path = str(self.data.get("thumbnail_path") or "")
@@ -288,6 +287,8 @@ class UserSettings:
             "default_start_episode": 1,
             "default_season": 1,
             "default_audio": "SUB",
+            "custom_caption": "",
+            "caption_disabled": False,
         }
 
     def get(self) -> Dict[str, Any]:
@@ -304,7 +305,6 @@ class UserSettings:
         self._save()
 
     def get_watermark(self) -> Dict[str, Any]:
-        """Return a detached snapshot for menus and queued tasks."""
         self._normalize()
         return deepcopy(self.data["watermark"])
 
@@ -425,4 +425,29 @@ class UserSettings:
 
     def set_format(self, fmt: str) -> None:
         self.data["format"] = fmt
+        self._save()
+
+    def get_caption(self) -> str:
+        return str(self.data.get("custom_caption") or "")
+
+    def is_caption_disabled(self) -> bool:
+        return bool(self.data.get("caption_disabled", False))
+
+    def get_caption_template(self) -> str:
+        if self.is_caption_disabled():
+            return ""
+        return self.get_caption() or DEFAULT_CAPTION_TEMPLATE
+
+    def set_caption(self, template: str) -> None:
+        self.data["custom_caption"] = str(template or "").strip()
+        self.data["caption_disabled"] = False
+        self._save()
+
+    def clear_caption(self) -> None:
+        self.data["custom_caption"] = ""
+        self.data["caption_disabled"] = False
+        self._save()
+
+    def disable_caption(self) -> None:
+        self.data["caption_disabled"] = True
         self._save()

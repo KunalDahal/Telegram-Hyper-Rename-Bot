@@ -13,7 +13,6 @@ class MediaInfoHelper:
         self.author_name  = "Encode Bot"
         self.author_url   = "https://t.me/your_bot_username"
 
-    # ── Telegraph ─────────────────────────────────────────────────────────────
 
     async def create_account(self):
         if not self.access_token:
@@ -36,7 +35,6 @@ class MediaInfoHelper:
             await asyncio.sleep(e.retry_after)
             return await self.create_page(title, content)
 
-    # ── Partial download (Telegram files only) ────────────────────────────────
 
     async def download_partial(self, client, media, save_path: str,
                                max_bytes: int = 3 * 1024 * 1024):
@@ -54,7 +52,6 @@ class MediaInfoHelper:
                 if received >= max_bytes:
                     break
 
-    # ── pymediainfo parse (sync → run in executor) ───────────────────────────
 
     def _parse_sync(self, target: str) -> MediaInfo:
         return MediaInfo.parse(target)
@@ -63,16 +60,15 @@ class MediaInfoHelper:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._parse_sync, target)
 
-    # ── Build Telegraph HTML ──────────────────────────────────────────────────
 
     TRACK_META = {
-        "General": ("🗒",  "General"),
-        "Video":   ("🎞",  "Video"),
-        "Audio":   ("🔊",  "Audio"),
-        "Text":    ("🔠",  "Subtitle"),
-        "Menu":    ("📑",  "Menu"),
-        "Image":   ("🖼",  "Image"),
-        "Other":   ("📄",  "Other"),
+        "General": ("▸",  "General"),
+        "Video":   ("▸",  "Video"),
+        "Audio":   ("▸",  "Audio"),
+        "Text":    ("▸",  "Subtitle"),
+        "Menu":    ("▸",  "Menu"),
+        "Image":   ("▸",  "Image"),
+        "Other":   ("▸",  "Other"),
     }
 
     SKIP_FIELDS = {
@@ -123,12 +119,12 @@ class MediaInfoHelper:
         return "\n".join(lines)
 
     def build_html(self, media_info: MediaInfo, filename: str) -> str:
-        html = f"<h4>📌 {filename}</h4>"
+        html = f"<h4>▸ {filename}</h4>"
         type_counters: dict[str, int] = {}
 
         for track in media_info.tracks:
             ttype              = track.track_type
-            emoji, base_label  = self.TRACK_META.get(ttype, ("📄", ttype))
+            emoji, base_label  = self.TRACK_META.get(ttype, ("▸", ttype))
 
             if ttype == "General":
                 label = base_label
@@ -145,7 +141,6 @@ class MediaInfoHelper:
 
         return html
 
-    # ── Public entry point ────────────────────────────────────────────────────
 
     async def generate_mediainfo(self, target: str, filename: str):
         try:

@@ -13,22 +13,32 @@ def setup_set_handlers(app: Client, user_settings, config, access_control):
     @app.on_message(command_filter(config, ["ss", "set_start_episode"]) & allowed_filter)
     async def set_start_episode_command(client: Client, message: Message):
         user_id = message.from_user.id
-        if not await access_control.is_authorized(user_id):
+        if not await access_control.can_use_premium_features(user_id):
             return
         if len(message.command) != 2 or not message.command[1].isdigit():
             await message.reply_text(
-                "Usage: <code>/ss &lt;episode&gt;</code>\nExample: <code>/ss 001</code>",
+                "<b>▸ Usage</b>\n"
+                "────────────────\n"
+                "<blockquote><code>/ss &lt;episode&gt;</code></blockquote>\n"
+                "<i>Example:</i> <code>/ss 001</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
 
         episode = int(message.command[1])
         if episode < 1:
-            await message.reply_text("Episode must be at least <code>1</code>.", parse_mode=ParseMode.HTML)
+            await message.reply_text(
+                "<b>▸ Invalid Value</b>\n"
+                "────────────────\n"
+                "Episode must be at least <code>1</code>.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         user_settings(user_id).update("default_start_episode", message.command[1])
         await message.reply_text(
+            f"<b>▸ Saved</b>\n"
+            f"────────────────\n"
             f"Start episode set to <code>{message.command[1]}</code>.",
             parse_mode=ParseMode.HTML,
         )
@@ -37,12 +47,14 @@ def setup_set_handlers(app: Client, user_settings, config, access_control):
     async def set_thumbnail_command(client: Client, message: Message):
         user_id = message.from_user.id
 
-        if not await access_control.is_authorized(user_id):
+        if not await access_control.can_use_premium_features(user_id):
             return
 
         replied = message.reply_to_message
         if not replied:
             await message.reply_text(
+                "<b>▸ Usage</b>\n"
+                "────────────────\n"
                 "Reply to a photo with <code>/st2</code> to set it as your thumbnail.",
                 parse_mode=ParseMode.HTML,
             )
@@ -56,7 +68,9 @@ def setup_set_handlers(app: Client, user_settings, config, access_control):
 
         if not is_photo and not is_img_doc:
             await message.reply_text(
-                "The replied message must be a photo or an image file.",
+                "<b>▸ Invalid File</b>\n"
+                "────────────────\n"
+                "<i>The replied message must be a photo or an image file.</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -69,19 +83,27 @@ def setup_set_handlers(app: Client, user_settings, config, access_control):
             downloaded = await client.download_media(replied, file_name=dest_path)
 
             if not downloaded or not os.path.exists(downloaded):
-                await message.reply_text("Failed to download the image. Please try again.")
+                await message.reply_text(
+                    "<b>▸ Download Failed</b>\n"
+                    "────────────────\n"
+                    "<i>Could not download the image. Please try again.</i>"
+                )
                 return
 
             us = user_settings(user_id)
             us.set_thumbnail(os.path.abspath(downloaded))
 
             await message.reply_text(
-                "✅ Thumbnail saved successfully.",
+                "<b>▸ Thumbnail Saved</b>\n"
+                "────────────────\n"
+                "<u>Saved successfully</u> and ready to use.",
                 parse_mode=ParseMode.HTML,
             )
 
         except Exception as e:
             await message.reply_text(
-                f"<b>Error saving thumbnail:</b> <code>{e}</code>",
+                f"<b>▸ Error Saving Thumbnail</b>\n"
+                f"────────────────\n"
+                f"<code>{e}</code>",
                 parse_mode=ParseMode.HTML,
             )

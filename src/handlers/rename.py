@@ -4,8 +4,10 @@ import re
 import shutil
 import uuid
 from datetime import datetime
+from html import escape
 
 from pyrogram import Client
+from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import Message
 import logging
@@ -45,7 +47,7 @@ _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 async def _safe_edit(msg, text: str):
     try:
-        await call_with_flood_retry(msg.edit_text, text)
+        await call_with_flood_retry(msg.edit_text, text, parse_mode=ParseMode.HTML)
     except MessageNotModified:
         pass
     except Exception:
@@ -92,13 +94,16 @@ async def fetch_sequential_messages(
 
 async def _check_access(client, message: Message, access_control) -> bool:
     user_id = message.from_user.id
-    if not await access_control.is_authorized(user_id):
+    if not await access_control.can_use_premium_features(user_id):
         return False
     try:
         await client.get_chat(user_id)
     except Exception:
         await message.reply_text(
-            "⚠️ Please start the bot in DM before giving tasks here."
+            "<b>▸ Start Required</b>\n"
+            "────────────────\n"
+            "Please start the bot in <u>DM</u> before giving tasks here.",
+            parse_mode=ParseMode.HTML,
         )
         return False
     return True
@@ -178,7 +183,7 @@ def _media_debug_label(msg: Message) -> str:
     filename = (getattr(media, "file_name", None) or "").strip() or "no filename"
     mime_type = (getattr(media, "mime_type", None) or "").strip() or "no mime"
     media_kind = "video" if msg.video else "document"
-    return f"{media_kind}, `{filename}`, `{mime_type}`"
+    return f"{media_kind}, <code>{escape(filename)}</code>, <code>{escape(mime_type)}</code>"
 
 
 def _parse_rename_command(message):
@@ -194,22 +199,22 @@ def _parse_rename_command(message):
         if num_match:
             batch_count = int(num_match.group(1))
             if batch_count < 2:
-                return False, None, None, "`-b <N>` requires N ≥ 2."
+                return False, None, None, "<code>-b &lt;N&gt;</code> requires N ≥ 2."
             if batch_count > 150:
-                return False, None, None, "Only 150 tasks can be batch renamed at a time. Please reply with `-b 150` or lower."
+                return False, None, None, "Only 150 tasks can be batch renamed at a time. Please reply with <code>-b 150</code> or lower."
             rest = num_match.group(2).strip()
         else:
             rest = rest.lstrip()
 
         if not rest:
-            return True, None, None, "Please provide a filename template after `-b`."
+            return True, None, None, "Please provide a filename template after <code>-b</code>."
 
         is_batch = True
         text = rest
 
     if not text:
         if is_batch:
-            return is_batch, batch_count, None, "Please provide a filename template after `-b`."
+            return is_batch, batch_count, None, "Please provide a filename template after <code>-b</code>."
         return is_batch, batch_count, None, None
     if (text.startswith('"') and text.endswith('"')) or \
        (text.startswith("'") and text.endswith("'")):
@@ -225,10 +230,10 @@ def _validate_batch_template(template: str):
     found = {m.group(1) for m in _PLACEHOLDER_RE.finditer(template)}
     unsupported = found - _SUPPORTED_PLACEHOLDERS
     if unsupported:
-        bad = ", ".join(f"`{{{p}}}`" for p in sorted(unsupported))
+        bad = ", ".join(f"<code>{{{p}}}</code>" for p in sorted(unsupported))
         return False, (
             f"Unsupported placeholder(s): {bad}\n"
-            "Only `{episode}` is allowed in batch rename filenames."
+            "Only <code>{episode}</code> is allowed in batch rename filenames."
         )
     return True, None
 
@@ -240,13 +245,6 @@ def _resolve_template(template: str, ep_str: str) -> str:
 
 
 def _primary_username(chat) -> str | None:
-    """Best-effort public @username for a Chat, if it has one.
-
-    Used so the worker can `join_chat()` a source chat the Premium
-    session has never been a member of -- Telegram only allows joining by
-    username or invite link, never by the bare numeric chat ID that's all
-    `source_chat_id` otherwise carries.
-    """
     username = getattr(chat, "username", None)
     if username:
         return username
@@ -259,6 +257,7 @@ def _primary_username(chat) -> str | None:
 
 def _build_task(
     *,
+    task_id: str,
     message: Message,
     source_message: Message,
     file_id: str,
@@ -268,21 +267,41 @@ def _build_task(
     output_filename: str,
     settings: dict,
     watermark: dict,
+    caption_template: str,
     created_at: str,
     batch: bool = False,
 ) -> dict:
+    # `settings`/`watermark` are expected to already be a per-task deep copy with
+    # any asset paths frozen (see `_freeze_task_assets`, which must run before this
+    # is called). We deep-copy once more here purely for isolation/defense-in-depth,
+    # not because anything upstream still needs freezing.
     settings_snapshot = copy.deepcopy(settings)
     watermark_snapshot = copy.deepcopy(watermark)
+
+    # `task_assets` holds the concrete, task-owned files this task depends on
+    # (already frozen onto disk by `_freeze_task_assets`, called before this
+    # function). `settings_snapshot`/`watermark` keep only the *configuration*
+    # the user had selected (auto-thumbnail flag, watermark styling, etc.).
+    # Previously the same frozen thumbnail path was copied into three places
+    # (top-level task, settings_snapshot, and the job dict) with no single
+    # place actually treated as authoritative afterwards - just an `or` chain
+    # of fallbacks hoping they stayed in sync. Keeping one asset block avoids
+    # that duplication and makes "what settings vs. what files" unambiguous.
+    task_assets = {
+        "thumbnail_path":      settings_snapshot.pop("thumbnail_path", "") or "",
+        "watermark_font_path": watermark_snapshot.pop("font_path", "") or "",
+    }
+
     job = {
         "resolution":      "rename",
         "output_filename": output_filename,
         "processing_mode": "rename",
         "audio_bitrate":   None,
         "metadata":        copy.deepcopy(settings_snapshot.get("metadata", {})),
-        "thumbnail_path":  settings_snapshot.get("thumbnail_path", ""),
         "send_type":       settings_snapshot.get("send_type", "media"),
     }
     return {
+        "task_id":                   task_id,
         "user_id":                   message.from_user.id,
         "first_name":                message.from_user.first_name,
         "username":                  message.from_user.username,
@@ -306,16 +325,16 @@ def _build_task(
         "total_jobs":                1,
         "current_job":               0,
         "current_stage":             "queued",
-        "thumbnail_path":            settings_snapshot.get("thumbnail_path", ""),
+        "task_assets":               task_assets,
         "watermark":                 watermark_snapshot,
         "settings_snapshot":         settings_snapshot,
+        "caption_template":          caption_template,
         "task_type":                 "rename",
         "batch_rename":              batch,
     }
 
 
 def _snapshot_enqueue_assets(settings: dict, watermark: dict, temp_base: str) -> str:
-    """Create immutable source copies before a batch command performs any await."""
     snapshot_dir = os.path.join(temp_base, f".enqueue_{uuid.uuid4().hex}")
     os.makedirs(snapshot_dir, exist_ok=True)
 
@@ -336,64 +355,49 @@ def _snapshot_enqueue_assets(settings: dict, watermark: dict, temp_base: str) ->
     return snapshot_dir
 
 
-def _freeze_task_assets(task_queue, task_id: str, task: dict, temp_base: str) -> None:
-    """Freeze per-user assets into the task folder at enqueue time.
+def _freeze_task_assets(task_id: str, settings_snapshot: dict, watermark_snapshot: dict, temp_base: str) -> None:
+    """Copy the thumbnail/watermark-font this task depends on into a folder owned
+    by the task, and rewrite the paths in `settings_snapshot`/`watermark_snapshot`
+    in place to point there.
 
-    A queued task must never start later with a newer thumbnail or watermark
-    font after the user changes settings. Task-local copies also make concurrent
-    jobs from the same user completely filesystem-isolated.
+    IMPORTANT: this must be called on the per-task settings/watermark snapshot
+    *before* `_build_task`/`task_queue.create_task` — i.e. before the task exists
+    in the queue or has been checkpointed — so the task is enqueued already in its
+    final, immutable form instead of being queued first and mutated afterward.
     """
     task_folder = os.path.join(temp_base, task_id)
-    os.makedirs(task_folder, exist_ok=True)
 
-    source_thumb = str(task.get("thumbnail_path") or "")
-    if source_thumb and os.path.isfile(source_thumb):
-        frozen_thumb = os.path.join(task_folder, f"thumbnail_{task_id}.jpg")
-        try:
-            shutil.copy2(source_thumb, frozen_thumb)
-            frozen_thumb = os.path.abspath(frozen_thumb)
-            task["thumbnail_path"] = frozen_thumb
-            settings_snapshot = task.get("settings_snapshot")
-            if isinstance(settings_snapshot, dict):
-                settings_snapshot["thumbnail_path"] = frozen_thumb
-            for job in task.get("jobs") or []:
-                if isinstance(job, dict):
-                    job["thumbnail_path"] = frozen_thumb
-        except Exception:
-            logger.exception("[rename] Could not freeze thumbnail for task %s", task_id)
-            task["thumbnail_path"] = ""
-            settings_snapshot = task.get("settings_snapshot")
-            if isinstance(settings_snapshot, dict):
-                settings_snapshot["thumbnail_path"] = ""
-            for job in task.get("jobs") or []:
-                if isinstance(job, dict):
-                    job["thumbnail_path"] = ""
-
-    watermark = task.get("watermark")
-    if isinstance(watermark, dict):
-        source_font = str(watermark.get("font_path") or "")
-        if source_font and os.path.isfile(source_font):
-            ext = os.path.splitext(source_font)[1] or ".ttf"
-            frozen_font = os.path.join(task_folder, f"watermark_font_{task_id}{ext}")
+    source_thumb = str(settings_snapshot.get("thumbnail_path") or "")
+    if source_thumb:
+        if os.path.isfile(source_thumb):
+            os.makedirs(task_folder, exist_ok=True)
+            frozen_thumb = os.path.join(task_folder, f"thumbnail_{task_id}.jpg")
             try:
-                shutil.copy2(source_font, frozen_font)
-                frozen_font = os.path.abspath(frozen_font)
-                watermark["font_path"] = frozen_font
-                settings_snapshot = task.get("settings_snapshot")
-                if isinstance(settings_snapshot, dict):
-                    snap_wm = settings_snapshot.get("watermark")
-                    if isinstance(snap_wm, dict):
-                        snap_wm["font_path"] = frozen_font
+                shutil.copy2(source_thumb, frozen_thumb)
+                settings_snapshot["thumbnail_path"] = os.path.abspath(frozen_thumb)
             except Exception:
-                logger.exception("[rename] Could not freeze watermark font for task %s", task_id)
-                watermark["font_path"] = ""
-                settings_snapshot = task.get("settings_snapshot")
-                if isinstance(settings_snapshot, dict):
-                    snap_wm = settings_snapshot.get("watermark")
-                    if isinstance(snap_wm, dict):
-                        snap_wm["font_path"] = ""
+                logger.exception("[rename] Could not freeze thumbnail for task %s", task_id)
+                settings_snapshot["thumbnail_path"] = ""
+        else:
+            # Path no longer exists (e.g. cleared/replaced between settings capture
+            # and freeze) - don't let a dangling path leak into the queued task.
+            settings_snapshot["thumbnail_path"] = ""
 
-    task_queue.checkpoint(task_id)
+    if isinstance(watermark_snapshot, dict):
+        source_font = str(watermark_snapshot.get("font_path") or "")
+        if source_font:
+            if os.path.isfile(source_font):
+                os.makedirs(task_folder, exist_ok=True)
+                ext = os.path.splitext(source_font)[1] or ".ttf"
+                frozen_font = os.path.join(task_folder, f"watermark_font_{task_id}{ext}")
+                try:
+                    shutil.copy2(source_font, frozen_font)
+                    watermark_snapshot["font_path"] = os.path.abspath(frozen_font)
+                except Exception:
+                    logger.exception("[rename] Could not freeze watermark font for task %s", task_id)
+                    watermark_snapshot["font_path"] = ""
+            else:
+                watermark_snapshot["font_path"] = ""
 
 
 async def _process_single_rename(
@@ -406,7 +410,11 @@ async def _process_single_rename(
 ):
     if not message.reply_to_message:
         await message.reply_text(
-            'Reply to a video file.\nUsage: `/rename2 "movie.mkv"`'
+            "<b>▸ Usage</b>\n"
+            "────────────────\n"
+            'Reply to a video file.\n'
+            '<blockquote><code>/rename2 "movie.mkv"</code></blockquote>',
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -414,9 +422,12 @@ async def _process_single_rename(
 
     if not _is_video_message(replied):
         await message.reply_text(
+            f"<b>▸ Unsupported File</b>\n"
+            f"────────────────\n"
             f"Only video files are supported.\n"
-            f"Detected: {_media_debug_label(replied)}\n"
-            f"Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}"
+            f"Detected → <code>{_media_debug_label(replied)}</code>\n"
+            f"Allowed → <code>{escape(', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS)))}</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -425,8 +436,10 @@ async def _process_single_rename(
 
     if not _valid_extension(filename):
         await message.reply_text(
-            f"Invalid file extension.\n"
-            f"Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}"
+            f"<b>▸ Invalid Extension</b>\n"
+            f"────────────────\n"
+            f"Allowed → <code>{escape(', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS)))}</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -434,19 +447,30 @@ async def _process_single_rename(
 
     if not is_dc_allowed(file_id):
         await message.reply_text(
-            "This file is blocked by the current DC filter, so it was not queued."
+            "<b>▸ Blocked</b>\n"
+            "────────────────\n"
+            "<i>This file is blocked by the current DC filter, so it was not queued.</i>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     user_id      = message.from_user.id
     settings_obj = user_settings(user_id)
-    settings     = copy.deepcopy(settings_obj.get())
-    # A queued task must retain the settings from the moment it was created.
-    watermark    = copy.deepcopy(settings_obj.get_watermark())
+    settings         = copy.deepcopy(settings_obj.get())
+    watermark        = copy.deepcopy(settings_obj.get_watermark())
+    caption_template = settings_obj.get_caption_template()
 
     created_at = datetime.utcnow().isoformat()
 
+    # Reserve the id up front so assets can be frozen into a task-owned folder
+    # *before* the task is built and queued (no await happens between the settings
+    # snapshot above and this freeze, so there's no window for the live thumbnail/
+    # font to change out from under us).
+    task_id = uuid.uuid4().hex
+    _freeze_task_assets(task_id, settings, watermark, temp_base)
+
     task_data = _build_task(
+        task_id=task_id,
         message=message,
         source_message=replied,
         file_id=file_id,
@@ -456,21 +480,25 @@ async def _process_single_rename(
         output_filename=filename,
         settings=settings,
         watermark=watermark,
+        caption_template=caption_template,
         created_at=created_at,
         batch=False,
     )
 
     task_id  = task_queue.create_task(task_data)
-    _freeze_task_assets(task_queue, task_id, task_queue.get_task(task_id), temp_base)
     position = task_queue.get_queue_position(task_id)
 
     mode = "rename + metadata"
 
     await message.reply_text(
-        f"Task `{filename}` queued at position **[{position}]**\n"
-        f"Task ID : `{task_id}`\n"
-        f"**Mode:** {mode}\n"
-        f"**Output will be delivered to your DM.** Please wait patiently."
+        f"<b>▸ Task Queued</b>\n"
+        f"────────────────\n"
+        f"┃ File : <code>{escape(filename)}</code>\n"
+        f"┃ Position : <code>[{position}]</code>\n"
+        f"┃ Task ID : <code>{escape(str(task_id))}</code>\n"
+        f"┖ Mode : <code>{mode}</code>\n\n"
+        f"<blockquote><u>Output will be delivered to your DM.</u> Please wait patiently.</blockquote>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -485,10 +513,14 @@ async def _process_batch_rename(
 ):
     if not message.reply_to_message:
         await message.reply_text(
-            "Reply to the **first** file.\n\n"
-            "Usage:\n"
-            "  Media group : `/rename2 -b [E{episode}] Show Name.mkv`\n"
-            "  Sequential  : `/rename2 -b 6 [E{episode}] Show Name.mkv`"
+            "<b>▸ Usage</b>\n"
+            "────────────────\n"
+            "Reply to the <u>first</u> file.\n\n"
+            "<blockquote>"
+            "Media group : <code>/rename2 -b [E{episode}] Show Name.mkv</code>\n"
+            "Sequential  : <code>/rename2 -b 6 [E{episode}] Show Name.mkv</code>"
+            "</blockquote>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -496,25 +528,30 @@ async def _process_batch_rename(
 
     ok, err = _validate_batch_template(template)
     if not ok:
-        await message.reply_text(f"❌ {err}")
+        await message.reply_text(
+            f"<b>▸ Error</b>\n"
+            f"────────────────\n"
+            f"<code>{err}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if not _valid_extension(template):
         await message.reply_text(
+            f"<b>▸ Invalid Extension</b>\n"
+            f"────────────────\n"
             f"Invalid file extension in template.\n"
-            f"Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}"
+            f"Allowed → <code>{escape(', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS)))}</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     user_id      = message.from_user.id
     settings_obj = user_settings(user_id)
-    settings     = copy.deepcopy(settings_obj.get())
-    # A queued task must retain the settings from the moment it was created.
-    watermark    = copy.deepcopy(settings_obj.get_watermark())
+    settings         = copy.deepcopy(settings_obj.get())
+    watermark        = copy.deepcopy(settings_obj.get_watermark())
+    caption_template = settings_obj.get_caption_template()
 
-    # Freeze user-owned assets before the first await in a batch command.
-    # This prevents a concurrent settings change from replacing the source file
-    # underneath the snapshot while Telegram messages are being fetched.
     enqueue_snapshot_dir = _snapshot_enqueue_assets(settings, watermark, temp_base)
     try:
         episode_raw = str(settings.get("default_start_episode", "1"))
@@ -522,27 +559,41 @@ async def _process_batch_rename(
         ep_int      = int(episode_raw)
 
         if batch_count is not None:
-            status_msg  = await message.reply_text(f"⏳ Fetching {batch_count} messages…")
+            status_msg  = await message.reply_text(
+                f"<b>▸ Fetching</b>\n"
+                f"────────────────\n"
+                f"<i>Fetching {batch_count} messages…</i>",
+                parse_mode=ParseMode.HTML,
+            )
             raw_msgs    = await fetch_sequential_messages(
                 client, message.chat.id, replied.id, batch_count
             )
         else:
             if not replied.media_group_id:
                 await message.reply_text(
+                    "<b>▸ Not An Album</b>\n"
+                    "────────────────\n"
                     "The replied message is not part of a media group (album).\n"
                     "Send your files together as an album and reply to the first one,\n"
-                    "or use `-b <N>` to grab N individual messages starting from the replied one."
+                    "or use <code>-b &lt;N&gt;</code> to grab N individual messages starting from the replied one.",
+                    parse_mode=ParseMode.HTML,
                 )
                 return
-            status_msg  = await message.reply_text("⏳ Fetching media group…")
+            status_msg  = await message.reply_text(
+                "<b>▸ Fetching</b>\n"
+                "────────────────\n"
+                "<i>Fetching media group…</i>",
+                parse_mode=ParseMode.HTML,
+            )
             raw_msgs    = await fetch_media_group(client, message.chat.id, replied)
 
         if not raw_msgs:
             await _safe_edit(
                 status_msg,
-                "Could not find any media messages.\n"
-                + ("Make sure you replied to the first file of the group." if batch_count is None
-                   else f"No video/document messages found in the next {batch_count} message IDs.")
+                "<b>▸ Nothing Found</b>\n"
+                "────────────────\n"
+                + ("<i>Make sure you replied to the first file of the group.</i>" if batch_count is None
+                   else f"<i>No video/document messages found in the next {batch_count} message IDs.</i>")
             )
             return
 
@@ -562,21 +613,25 @@ async def _process_batch_rename(
             valid_files.append(mg_msg)
 
         if not valid_files:
+            header = "<b>▸ Nothing Queued</b>\n────────────────\n"
             if skipped_dc and not skipped_unsupported:
                 text = (
-                    "No files were queued because every video was blocked by the current DC filter."
+                    header
+                    + "<i>No files were queued — every video was blocked by the current DC filter.</i>"
                 )
             elif skipped_dc:
                 text = (
-                    f"No supported video files were queued.\n"
-                    f"Blocked by DC filter: {skipped_dc}\n"
-                    f"Unsupported/non-video: {skipped_unsupported}\n"
-                    f"Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}"
+                    header
+                    + f"No supported video files were queued.\n"
+                    f"┠ Blocked by DC filter : <code>{skipped_dc}</code>\n"
+                    f"┠ Unsupported/non-video : <code>{skipped_unsupported}</code>\n"
+                    f"┖ Allowed : <code>{', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}</code>"
                 )
             else:
                 text = (
-                    f"No supported video files found.\n"
-                    f"Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}"
+                    header
+                    + f"No supported video files found.\n"
+                    f"┖ Allowed : <code>{', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}</code>"
                 )
             await _safe_edit(
                 status_msg,
@@ -597,7 +652,18 @@ async def _process_batch_rename(
             output_filename = _resolve_template(template, ep_str)
             file_id, original_file_name, file_size = _file_info(mg_msg)
 
+            # `settings`/`watermark` here already point at the shared, pre-fetch
+            # snapshot dir (see `_snapshot_enqueue_assets` above) rather than the
+            # user's live, mutable files. Each task still gets its own deep copy
+            # and its own frozen, task-owned asset files before it's ever built or
+            # queued.
+            task_id = uuid.uuid4().hex
+            task_settings = copy.deepcopy(settings)
+            task_watermark = copy.deepcopy(watermark)
+            _freeze_task_assets(task_id, task_settings, task_watermark, temp_base)
+
             task_data = _build_task(
+                task_id=task_id,
                 message=message,
                 source_message=mg_msg,
                 file_id=file_id,
@@ -605,14 +671,14 @@ async def _process_batch_rename(
                 file_size=file_size,
                 source_thumbnail_file_id=_source_thumbnail_file_id(mg_msg),
                 output_filename=output_filename,
-                settings=settings,
-                watermark=watermark,
+                settings=task_settings,
+                watermark=task_watermark,
+                caption_template=caption_template,
                 created_at=created_at,
                 batch=True,
             )
 
             task_id  = task_queue.create_task(task_data)
-            _freeze_task_assets(task_queue, task_id, task_queue.get_task(task_id), temp_base)
             position = task_queue.get_queue_position(task_id)
             task_ids.append(task_id)
             positions.append(position)
@@ -627,15 +693,16 @@ async def _process_batch_rename(
 
         mode_label = f"sequential ({batch_count} msgs)" if batch_count else "media group"
         lines = [
-        f"Added {len(valid_files)} rename task(s) to the queue {pos_text}. ({mode_label})\n",
-        f"Episodes: {ep_start} to {ep_end}",
-        f"Mode: {mode}",
+        f"<b>▸ Batch Queued</b>\n────────────────",
+        f"┃ Added : <code>{len(valid_files)}</code> task(s) {pos_text} <i>({mode_label})</i>",
+        f"┠ Episodes : <code>{ep_start}</code> → <code>{ep_end}</code>",
+        f"┖ Mode : <code>{mode}</code>",
     ]
         if skipped_unsupported:
-            lines.append(f"**Skipped:** {skipped_unsupported} non-video file(s)")
+            lines.append(f"<b>Skipped:</b> <code>{skipped_unsupported}</code> non-video file(s)")
         if skipped_dc:
-            lines.append(f"**Blocked by DC filter:** {skipped_dc} file(s)")
-        lines.append("\n**Output will be delivered to your DM.** Please wait patiently.")
+            lines.append(f"<b>Blocked by DC filter:</b> <code>{skipped_dc}</code> file(s)")
+        lines.append("\n<blockquote><u>Output will be delivered to your DM.</u> Please wait patiently.</blockquote>")
 
         await _safe_edit(status_msg, "\n".join(lines))
     finally:
@@ -650,7 +717,6 @@ async def process_rename_command(
     temp_base: str,
     access_control,
 ):
-    # One access/DM-start check per /rename command, including the whole batch.
     if not await _check_access(client, message, access_control):
         return
 
@@ -658,11 +724,16 @@ async def process_rename_command(
 
     if parse_error:
         await message.reply_text(
-            f"❌ {parse_error}\n\n"
-            "Usage:\n"
-            "  Single     : `/rename2 movie.mkv`\n"
-            "  Batch group: `/rename2 -b [E{episode}] Show.mkv`\n"
-            "  Batch seq  : `/rename2 -b 6 [E{episode}] Show.mkv`"
+            f"<b>▸ Error</b>\n"
+            f"────────────────\n"
+            f"<code>{parse_error}</code>\n\n"
+            "<b>▸ Usage</b>\n"
+            "<blockquote>"
+            "Single     : <code>/rename2 movie.mkv</code>\n"
+            "Batch group: <code>/rename2 -b [E{episode}] Show.mkv</code>\n"
+            "Batch seq  : <code>/rename2 -b 6 [E{episode}] Show.mkv</code>"
+            "</blockquote>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -675,7 +746,6 @@ async def process_rename_command(
 
 
 def setup_rename_handler(app: Client, task_queue, user_settings, config, access_control):
-    # /rename is group-only: it must never run in a private chat.
     @app.on_message(command_filter(config, ["r", "rename"]) & group_scope_filter(config))
     async def rename_command(client: Client, message: Message):
         await process_rename_command(

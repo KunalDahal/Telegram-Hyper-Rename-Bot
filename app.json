@@ -11,11 +11,11 @@
   ],
   "env": {
     "OWNER_IDS": {
-      "description": "Bootstrap owner IDs (comma-separated). They can manage MongoDB-backed admins and restart the bot.",
+      "description": "Bootstrap owner IDs (comma-separated, supports multiple). They can grant/revoke Premium, ban/unban, and restart the bot.",
       "value": ""
     },
     "MONGO_URI": {
-      "description": "MongoDB connection URI used to store administrators and persistent rename-task checkpoints",
+      "description": "MongoDB connection URI used to store Premium/banned users and persistent rename-task checkpoints",
       "value": "",
       "required": true
     },

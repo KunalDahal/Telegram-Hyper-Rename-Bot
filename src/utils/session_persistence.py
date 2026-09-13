@@ -1,55 +1,3 @@
-"""Make SESSION_STRING-based Pyrogram clients keep a durable, on-disk peer
-cache across container restarts.
-
-Why this exists
-----------------
-Both `Client("...", session_string=X, in_memory=False)` calls in this
-codebase used to *look* like they'd get file-backed storage once
-`in_memory` was False. They didn't. Pyrogram/kurigram's own
-`Client.__init__` picks the storage engine like this (confirmed against the
-installed `kurigram` build)::
-
-    if self.session_string:
-        self.storage = SQLiteStorage(name, workdir=workdir, session_string=session_string, in_memory=True)
-    elif self.in_memory:
-        self.storage = SQLiteStorage(name, workdir=workdir, in_memory=True)
-    ...
-    else:
-        self.storage = SQLiteStorage(name, workdir=workdir)
-
-Passing `session_string` *at all* forces `in_memory=True`, full stop --
-the `in_memory` constructor argument is only consulted when
-`session_string` is falsy. So a client built with
-`session_string=config.session_string, in_memory=False` silently got
-`MemoryStorage` anyway, and its peer cache (the access-hash table
-`resolve_peer` depends on) was wiped on every restart. That's the actual
-cause of the "works right after a resolve, breaks again after a restart"
-`CHANNEL_INVALID` / `ID not found` pattern.
-
-Pyrogram also has no built-in way to seed a *file-backed* session from a
-session string -- `SQLiteStorage.open()` only decodes `session_string`
-when `in_memory=True`; the file-storage branch ignores it entirely and
-just creates an empty database. So a one-time migration step is required.
-
-What this does
----------------
-`ensure_persistent_session()` materializes `{workdir}/{name}.session` from
-a SESSION_STRING using a live in-memory SQLiteStorage (opened the normal
-way, so decoding stays correct across pyrogram/kurigram versions instead
-of hand-parsing the session-string struct format), then does a raw SQLite
-`backup()` of that populated database into the on-disk file.
-
-After that, the *real* Client should be constructed with
-`workdir=..., in_memory=False` and no `session_string` at all, so it opens
-the file directly. Every peer it resolves during that run is then written
-straight to disk, and survives the next restart.
-
-Re-running with the same SESSION_STRING is a cheap no-op (a fingerprint of
-the string is stored alongside the session file). If the configured
-SESSION_STRING changes -- e.g. the operator rotates to a different
-Premium account -- the stale file is rebuilt instead of silently reused,
-since a changed credential should not be treated as unchanged.
-"""
 
 from __future__ import annotations
 
@@ -65,18 +13,21 @@ logger = logging.getLogger(__name__)
 
 
 def fingerprint(session_string: str) -> str:
-    """Short, stable fingerprint of a SESSION_STRING.
-
-    Exposed so callers can cheaply check "is this the same credential I
-    already have a client running for?" without touching disk -- useful to
-    guard against building a second Client on top of the same on-disk
-    session file (see Worker._premium_session_fingerprint).
-    """
     return hashlib.sha256(session_string.encode("utf-8")).hexdigest()[:16]
 
 
-# Backwards-compatible private alias used within this module.
 _fingerprint = fingerprint
+
+
+def _is_valid_session_file(path: Path) -> bool:
+    try:
+        conn = sqlite3.connect(str(path))
+        try:
+            return conn.execute("SELECT number FROM version").fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
 
 
 async def ensure_persistent_session(
@@ -84,12 +35,6 @@ async def ensure_persistent_session(
     workdir: Union[str, Path],
     session_string: Optional[str],
 ) -> None:
-    """Ensure `{workdir}/{name}.session` exists and matches `session_string`.
-
-    No-op if `session_string` is empty (interactive/file-only login is left
-    exactly as Pyrogram normally handles it) or if a session file already
-    on disk was built from this exact SESSION_STRING.
-    """
     session_string = (session_string or "").strip()
     if not session_string:
         return
@@ -106,14 +51,21 @@ async def ensure_persistent_session(
     )
 
     if session_path.exists() and existing_fingerprint == new_fingerprint:
-        logger.debug(
-            "[Session] Persistent session for %r already matches the "
-            "configured SESSION_STRING; keeping its peer cache.",
-            name,
+        if _is_valid_session_file(session_path):
+            logger.debug(
+                "[Session] Persistent session for %r already matches the "
+                "configured SESSION_STRING; keeping its peer cache.",
+                name,
+            )
+            return
+        logger.warning(
+            "[Session] Persistent session for %r matches the configured "
+            "SESSION_STRING's fingerprint but %s has no usable 'version' "
+            "table (a corrupt/partial file from a previous run). "
+            "Rebuilding it instead of trusting the stale fingerprint.",
+            name, session_path,
         )
-        return
-
-    if existing_fingerprint is not None and existing_fingerprint != new_fingerprint:
+    elif existing_fingerprint is not None and existing_fingerprint != new_fingerprint:
         logger.warning(
             "[Session] SESSION_STRING for %r changed since the last run; "
             "rebuilding %s (previous peer cache is discarded).",
@@ -131,22 +83,30 @@ async def ensure_persistent_session(
     )
     await mem_storage.open()
     try:
-        # Decoding a bad/expired SESSION_STRING should fail loudly here,
-        # the same way it would have failed inside client.start() before --
-        # not be swallowed into a silent fallback.
         await mem_storage.auth_key()
 
         if session_path.exists():
             session_path.unlink()
 
-        # Flush pending writes on the source connection first: sqlite's
-        # backup() step can otherwise deadlock against an open write
-        # transaction on the very same connection.
-        mem_storage.conn.commit()
+        await mem_storage.conn.commit()
 
         file_conn = sqlite3.connect(str(session_path))
         try:
-            mem_storage.conn.backup(file_conn)
+            await mem_storage.conn.backup(file_conn)
+            try:
+                version_row = file_conn.execute(
+                    "SELECT number FROM version"
+                ).fetchone()
+            except sqlite3.OperationalError as verify_err:
+                raise RuntimeError(
+                    f"Backup of session {name!r} to {session_path} did not "
+                    f"produce a valid Pyrogram session file: {verify_err}"
+                ) from verify_err
+            if version_row is None:
+                raise RuntimeError(
+                    f"Backup of session {name!r} to {session_path} produced "
+                    "a version table with no row."
+                )
         finally:
             file_conn.close()
     finally:
