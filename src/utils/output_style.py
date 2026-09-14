@@ -100,13 +100,23 @@ def apply_global_styling() -> None:
         Client.edit_message_caption = _wrap_outgoing(
             Client.edit_message_caption, param_name="caption"
         )
+    # `send_cached_media` (used internally by pyrogram's `copy_message`/`Message.copy`
+    # for every media kind) is deliberately left unpatched, so copy-based delivery
+    # never gets the house font. The direct send_* methods below ARE patched because
+    # they're also used for the bot's own UI captions (welcome banner, settings
+    # screenshots, etc). Before patching, stash the original (unstyled) callable on
+    # the class so delivery code that already built its own caption — and must match
+    # the unstyled copy_message behaviour regardless of media kind — can call it
+    # directly instead of going through the house-font wrapper. See
+    # `Worker._resend_media` in services/worker.py, which is the one caller that
+    # needs this: it's the fallback used when `copy_message` itself fails, and it
+    # must look the same to the user as a successful copy_message delivery would
+    # have, whether the file is a video, document, audio, or photo.
     for method_name in ("send_photo", "send_document", "send_video", "send_animation", "send_audio"):
         if hasattr(Client, method_name):
-            setattr(
-                Client,
-                method_name,
-                _wrap_outgoing(getattr(Client, method_name), param_name="caption"),
-            )
+            original = getattr(Client, method_name)
+            setattr(Client, f"_unstyled_{method_name}", original)
+            setattr(Client, method_name, _wrap_outgoing(original, param_name="caption"))
 
     InputMediaPhoto.__init__ = _wrap_media_caption_init(InputMediaPhoto.__init__)
     InputMediaDocument.__init__ = _wrap_media_caption_init(InputMediaDocument.__init__)

@@ -15,6 +15,7 @@ from src.services.downloader import Downloader
 from src.services.media_processor import MediaProcessor
 from src.services.uploader import Uploader
 from src.utils.retry import call_with_flood_retry
+from src.utils.safe_path import safe_join
 from src.utils.session_persistence import ensure_persistent_session, fingerprint as _session_fingerprint
 
 
@@ -25,13 +26,26 @@ BOT_PART_SIZE = int(1.95 * 1024 ** 3)
 PREMIUM_PART_SIZE = int(3.95 * 1024 ** 3)
 MAX_PIPELINE_SLOTS = 4
 
+# Matches the "User ID"/"Task ID" lines written into every dump caption by
+# Uploader._dump_caption. Used to double-check, before the master bot
+# forwards a dump message out to a user, that the message actually belongs
+# to the task it's about to be delivered for.
+_DUMP_CAPTION_USER_ID_RE = re.compile(r"User ID\s*:\s*<code>(\d+)</code>")
+_DUMP_CAPTION_TASK_ID_RE = re.compile(r"Task ID\s*:\s*<code>([0-9a-fA-F]+)</code>")
+
 
 class Worker:
     def __init__(self, task_queue, user_settings_getter, client, config, helper_bots=None, helper_loads=None):
         self.task_queue = task_queue
         self.user_settings_getter = user_settings_getter
         self.client = client
-        self.download_client = client
+        # Message fetching (get_messages) for every download - including the
+        # reference read that support/helper bots use to derive their own
+        # file_id - is always done with the master bot client. The Premium
+        # session, when configured, is confined to the dump chat: staging
+        # large source files into it and uploading large processed outputs
+        # there. It never fetches on behalf of a download and never talks to
+        # a user directly (see _deliver_dump_messages).
         self.helper_bots = helper_bots or {}
         self.helper_loads = helper_loads or {}
         self._premium_download_client: Client | None = None
@@ -60,18 +74,15 @@ class Worker:
         self.max_rename_at_once = self.workers
         self.download_limit = self.workers
         self.upload_limit = self.workers
-        self.watermark_limit = self.workers
 
         self._download_slot = asyncio.Semaphore(self.download_limit)
         self._upload_slot = asyncio.Semaphore(self.upload_limit)
-        self._watermark_processing_slot = asyncio.Semaphore(self.watermark_limit)
         logger.info(
-            "[Worker] Concurrency: WORKERS=%d (jobs=%d download=%d upload=%d watermark=%d)",
+            "[Worker] Concurrency: WORKERS=%d (jobs=%d download=%d upload=%d)",
             self.workers,
             self.pool_size,
             self.download_limit,
             self.upload_limit,
-            self.watermark_limit,
         )
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._pool_worker_tasks: list[asyncio.Task] = []
@@ -163,44 +174,6 @@ class Worker:
                     )
 
         return None
-
-    async def _ensure_user_peer_resolved(
-        self, client: Client, user_id: int, username: str | None
-    ) -> None:
-        if client is self.client:
-            return
-
-        try:
-            await client.get_chat(user_id)
-            return
-        except Exception:
-            logger.debug(
-                "[Worker] Premium session has no cached peer for user_id=%s "
-                "yet; attempting to resolve one.",
-                user_id, exc_info=True,
-            )
-
-        if username:
-            try:
-                await client.get_users(username)
-                return
-            except Exception:
-                logger.warning(
-                    "[Worker] Could not resolve @%s (user_id=%s) via "
-                    "username for the Premium session.",
-                    username, user_id, exc_info=True,
-                )
-
-        raise RuntimeError(
-            f"The Premium session has never interacted with user "
-            f"{user_id} and can't resolve them"
-            + (f" (tried @{username})" if username else " (no public "
-               "@username on file to resolve them by")
-            + ". Files over 2 GiB must be delivered by the Premium "
-              "account, but Telegram requires it to have already 'met' "
-              "the recipient -- either via a public @username, or by the "
-              "user starting a chat with the Premium account once."
-        )
 
     async def start(self):
         self.running = True
@@ -349,7 +322,6 @@ class Worker:
         previous = self._premium_download_client
         self._premium_download_client = candidate
         self._premium_session_fingerprint = new_fingerprint
-        self.download_client = candidate
         self._premium_dump_chat_id = premium_dump_id
 
         if previous:
@@ -428,7 +400,6 @@ class Worker:
         self._premium_extra_dump_chat_id = None
         self._premium_dump_can_write = None
         self._premium_extra_dump_can_write = None
-        self.download_client = self.client
         for client in clients:
             if not client:
                 continue
@@ -488,11 +459,6 @@ class Worker:
 
     def _refresh_current_task(self):
         self.task_queue.current_task = next(iter(self._active_tasks), None)
-
-    @staticmethod
-    def _has_watermark(task: dict) -> bool:
-        watermark = task.get("watermark", {})
-        return bool(watermark.get("enabled") and str(watermark.get("text", "")).strip())
 
     def _uses_premium_download(self, task: dict) -> bool:
         return False
@@ -787,6 +753,10 @@ class Worker:
         self.task_queue.update_status(task_id, "waiting_for_download", 0)
         async with self._download_slot:
             self.task_queue.update_status(task_id, "downloading", 0)
+            # Always the master bot: it is the one that reads the message
+            # (get_messages) whose file_id support bots then use to pull
+            # chunks in parallel. Support bots never resolve a message on
+            # their own and the Premium session is never used for this.
             download_client = self.client
             downloader = Downloader(
                 self.temp_base, self.task_queue, task_id,
@@ -823,16 +793,11 @@ class Worker:
             downloaded_path = await self._download_with_slot(task)
             job = self._build_job(task)
             task["output_filename"] = job["output_filename"]
-            has_watermark = self._has_watermark(task)
 
             prepared_path = task.get("prepared_upload_path", "")
             if task.get("prepared_completed") and prepared_path and os.path.isfile(prepared_path):
                 upload_path = prepared_path
                 logger.info("[Worker] Reusing prepared output for %s.", task_id[:8])
-            elif has_watermark:
-                self.task_queue.update_status(task_id, "waiting_for_processing", 0)
-                async with self._watermark_processing_slot:
-                    upload_path = await self._prepare_upload_file(task, downloaded_path, job)
             else:
                 upload_path = await self._prepare_upload_file(task, downloaded_path, job)
 
@@ -886,16 +851,8 @@ class Worker:
 
     async def _prepare_upload_file(self, task: dict, downloaded_path: str, job: dict) -> str:
         metadata     = job.get("metadata") or task.get("metadata", {})
-        watermark    = task.get("watermark", {})
-        # `watermark` on the task is pure styling configuration (enabled,
-        # text, color, timing, position); the actual font file it depends on
-        # lives in task_assets. Older persisted tasks may still carry the
-        # font path embedded in `watermark` itself, hence the fallback.
-        task_assets  = task.get("task_assets") or {}
-        watermark_font_path = task_assets.get("watermark_font_path") or watermark.get("font_path", "")
         has_metadata = any(str(v).strip() for v in metadata.values())
-        has_watermark = bool(watermark.get("enabled") and str(watermark.get("text", "")).strip())
-        if not has_metadata and not has_watermark:
+        if not has_metadata:
             return downloaded_path
 
         task_id     = task["task_id"]
@@ -906,19 +863,11 @@ class Worker:
         output_path = os.path.join(task_folder, f"processed_{task_id}{ext}")
 
         self.task_queue.update_status(task_id, "processing", 0)
-        if has_watermark:
-            logger.info(
-                "[Worker] %s starting watermark processing (mode=%s, output=%s).",
-                task_id[:8],
-                watermark.get("timing_mode", "range"),
-                os.path.basename(output_path),
-            )
         try:
             processed_path = await self.media_processor.process(
                 input_path=downloaded_path,
                 output_path=output_path,
                 metadata=metadata,
-                watermark={**watermark, "font_path": watermark_font_path},
             )
         except Exception:
             logger.exception("[Worker] %s media processing failed", task_id[:8])
@@ -949,7 +898,7 @@ class Worker:
         result = []
         for part_number, part_path in enumerate(ffmpeg_parts, start=1):
             name = self._part_filename(output_filename, part_number)
-            final_path = os.path.join(task_dir, name)
+            final_path = safe_join(task_dir, name, fallback=f"part_{part_number}")
             if os.path.abspath(part_path) != os.path.abspath(final_path):
                 os.replace(part_path, final_path)
             if os.path.getsize(final_path) > max_part_size:
@@ -1068,22 +1017,17 @@ class Worker:
     async def _deliver_dump_messages(self, task: dict) -> None:
         task_id = task["task_id"]
         dump_ids: list[int] = task.get("dump_message_ids") or []
-        use_premium_dump = bool(task.get("dump_used_premium"))
         delivered = set(task.get("delivered_message_ids") or [])
 
-        deliver_client = (
-            self._premium_download_client if use_premium_dump else self.client
-        )
-        if use_premium_dump and not deliver_client:
-            raise RuntimeError(
-                "This file was uploaded via the Premium session but no "
-                "Premium session is available anymore to deliver it. "
-                "Reconfigure SESSION_STRING and retry."
-            )
-
-        await self._ensure_user_peer_resolved(
-            deliver_client, task["user_id"], task.get("username")
-        )
+        # The master bot is always the one that delivers to the user, no
+        # matter which client uploaded the file into the dump. The Premium
+        # session (when configured) only ever talks to the dump chat - it
+        # stages/uploads there and stops; it never sends anything to a user
+        # directly. Because the master bot didn't necessarily do the dump
+        # upload itself, each dump message's caption is checked against this
+        # task's own user/task id below before it is sent, so a delivery can
+        # never be sent to the wrong person.
+        deliver_client = self.client
 
         for dump_id in dump_ids:
             if dump_id in delivered:
@@ -1091,7 +1035,9 @@ class Worker:
 
             source = await self._get_dump_message_with_retry(dump_id)
             source_unique_id = self._media_unique_id(source)
-            caption = self._delivery_caption(task, getattr(source, "caption", None))
+            raw_dump_caption = getattr(source, "caption", None)
+            self._verify_dump_caption_owner(task, dump_id, raw_dump_caption)
+            caption = self._delivery_caption(task, raw_dump_caption)
 
             delivered_ok = False
             try:
@@ -1199,6 +1145,35 @@ class Worker:
             return template.replace("{filename}", filename)
         return template
 
+    def _verify_dump_caption_owner(
+        self, task: dict, dump_id: int, dump_caption: str | None
+    ) -> None:
+        # Best-effort integrity check: the master bot forwards every dump
+        # message regardless of whether it or the Premium session uploaded
+        # it, so this confirms - from the caption stamped on at upload time -
+        # that the message it's about to send out is actually this task's
+        # file before it ever reaches the user. Legacy dump captions that
+        # predate this format simply have nothing to check and are let
+        # through unchanged.
+        if not dump_caption:
+            return
+
+        user_match = _DUMP_CAPTION_USER_ID_RE.search(dump_caption)
+        if user_match and user_match.group(1) != str(task["user_id"]):
+            raise RuntimeError(
+                f"Refusing to deliver dump message {dump_id}: caption User ID "
+                f"{user_match.group(1)} does not match task owner "
+                f"{task['user_id']}."
+            )
+
+        task_match = _DUMP_CAPTION_TASK_ID_RE.search(dump_caption)
+        if task_match and task_match.group(1) != str(task["task_id"]):
+            raise RuntimeError(
+                f"Refusing to deliver dump message {dump_id}: caption Task ID "
+                f"{task_match.group(1)} does not match task "
+                f"{task['task_id']}."
+            )
+
     @staticmethod
     async def _recently_delivered(client, user_id: int, file_unique_id: str) -> bool:
         try:
@@ -1216,24 +1191,42 @@ class Worker:
         return False
 
     async def _resend_media(self, client, user_id: int, source, caption: str | None) -> None:
+        # This is the fallback path used only when `copy_message` itself fails
+        # (see `_deliver_dump_messages`). `copy_message` delivers through
+        # pyrogram's `send_cached_media`, which the house-font patch in
+        # output_style.py never touches, so a successful copy shows the caption
+        # exactly as built by `_delivery_caption`. The plain `client.send_video`
+        # / `send_document` / etc. methods ARE patched (they're also used for the
+        # bot's own UI captions), so calling them here would silently re-run the
+        # already-formatted caption through the house font and mangle it -
+        # something that was showing up on media (video/photo/audio) sends more
+        # than on documents simply because this fallback triggers for them more
+        # often, not because of any intentional difference. Use the unstyled
+        # variants so this fallback always matches what copy_message would have
+        # produced, for every media kind.
+        send_video = getattr(client, "_unstyled_send_video", client.send_video)
+        send_document = getattr(client, "_unstyled_send_document", client.send_document)
+        send_audio = getattr(client, "_unstyled_send_audio", client.send_audio)
+        send_photo = getattr(client, "_unstyled_send_photo", client.send_photo)
+
         if getattr(source, "video", None):
             await call_with_flood_retry(
-                client.send_video, chat_id=user_id, video=source.video.file_id,
+                send_video, chat_id=user_id, video=source.video.file_id,
                 caption=caption, parse_mode=enums.ParseMode.HTML, supports_streaming=True,
             )
         elif getattr(source, "document", None):
             await call_with_flood_retry(
-                client.send_document, chat_id=user_id, document=source.document.file_id,
+                send_document, chat_id=user_id, document=source.document.file_id,
                 caption=caption, parse_mode=enums.ParseMode.HTML, force_document=True,
             )
         elif getattr(source, "audio", None):
             await call_with_flood_retry(
-                client.send_audio, chat_id=user_id, audio=source.audio.file_id, caption=caption,
+                send_audio, chat_id=user_id, audio=source.audio.file_id, caption=caption,
                 parse_mode=enums.ParseMode.HTML,
             )
         elif getattr(source, "photo", None):
             await call_with_flood_retry(
-                client.send_photo, chat_id=user_id, photo=source.photo.file_id, caption=caption,
+                send_photo, chat_id=user_id, photo=source.photo.file_id, caption=caption,
                 parse_mode=enums.ParseMode.HTML,
             )
         else:

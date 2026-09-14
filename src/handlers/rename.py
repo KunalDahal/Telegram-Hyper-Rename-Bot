@@ -15,6 +15,7 @@ import logging
 from src.utils.dc_checker import is_dc_allowed
 from src.utils.commands import command_filter, group_scope_filter
 from src.utils.retry import call_with_flood_retry
+from src.utils.safe_path import safe_filename
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -144,17 +145,19 @@ def _file_info(media_msg: Message):
     if media_msg.video:
         v = media_msg.video
         filename = (v.file_name or "").strip()
+        fallback = f"video_{_short_file_token(v)}.mp4"
         return (
             v.file_id,
-            filename or f"video_{_short_file_token(v)}.mp4",
+            safe_filename(filename, fallback=fallback) if filename else fallback,
             v.file_size,
         )
     d = media_msg.document
     filename = (d.file_name or "").strip()
     ext = _document_video_extension(d) or ".mkv"
+    fallback = f"video_{_short_file_token(d)}{ext}"
     return (
         d.file_id,
-        filename or f"video_{_short_file_token(d)}{ext}",
+        safe_filename(filename, fallback=fallback) if filename else fallback,
         d.file_size,
     )
 
@@ -223,7 +226,11 @@ def _parse_rename_command(message):
     if not text:
         return is_batch, batch_count, None, "Filename cannot be empty."
 
-    return is_batch, batch_count, text, None
+    sanitized = safe_filename(text, fallback="")
+    if not sanitized:
+        return is_batch, batch_count, None, "Filename cannot consist only of path separators or dots."
+
+    return is_batch, batch_count, sanitized, None
 
 
 def _validate_batch_template(template: str):
@@ -266,30 +273,13 @@ def _build_task(
     source_thumbnail_file_id: str,
     output_filename: str,
     settings: dict,
-    watermark: dict,
     caption_template: str,
     created_at: str,
     batch: bool = False,
 ) -> dict:
-    # `settings`/`watermark` are expected to already be a per-task deep copy with
-    # any asset paths frozen (see `_freeze_task_assets`, which must run before this
-    # is called). We deep-copy once more here purely for isolation/defense-in-depth,
-    # not because anything upstream still needs freezing.
     settings_snapshot = copy.deepcopy(settings)
-    watermark_snapshot = copy.deepcopy(watermark)
-
-    # `task_assets` holds the concrete, task-owned files this task depends on
-    # (already frozen onto disk by `_freeze_task_assets`, called before this
-    # function). `settings_snapshot`/`watermark` keep only the *configuration*
-    # the user had selected (auto-thumbnail flag, watermark styling, etc.).
-    # Previously the same frozen thumbnail path was copied into three places
-    # (top-level task, settings_snapshot, and the job dict) with no single
-    # place actually treated as authoritative afterwards - just an `or` chain
-    # of fallbacks hoping they stayed in sync. Keeping one asset block avoids
-    # that duplication and makes "what settings vs. what files" unambiguous.
     task_assets = {
-        "thumbnail_path":      settings_snapshot.pop("thumbnail_path", "") or "",
-        "watermark_font_path": watermark_snapshot.pop("font_path", "") or "",
+        "thumbnail_path": settings_snapshot.pop("thumbnail_path", "") or "",
     }
 
     job = {
@@ -326,7 +316,6 @@ def _build_task(
         "current_job":               0,
         "current_stage":             "queued",
         "task_assets":               task_assets,
-        "watermark":                 watermark_snapshot,
         "settings_snapshot":         settings_snapshot,
         "caption_template":          caption_template,
         "task_type":                 "rename",
@@ -334,7 +323,7 @@ def _build_task(
     }
 
 
-def _snapshot_enqueue_assets(settings: dict, watermark: dict, temp_base: str) -> str:
+def _snapshot_enqueue_assets(settings: dict, temp_base: str) -> str:
     snapshot_dir = os.path.join(temp_base, f".enqueue_{uuid.uuid4().hex}")
     os.makedirs(snapshot_dir, exist_ok=True)
 
@@ -344,23 +333,15 @@ def _snapshot_enqueue_assets(settings: dict, watermark: dict, temp_base: str) ->
         shutil.copy2(source_thumb, frozen_thumb)
         settings["thumbnail_path"] = os.path.abspath(frozen_thumb)
 
-    if isinstance(watermark, dict):
-        source_font = str(watermark.get("font_path") or "")
-        if source_font and os.path.isfile(source_font):
-            ext = os.path.splitext(source_font)[1] or ".ttf"
-            frozen_font = os.path.join(snapshot_dir, f"watermark_font{ext}")
-            shutil.copy2(source_font, frozen_font)
-            watermark["font_path"] = os.path.abspath(frozen_font)
-
     return snapshot_dir
 
 
-def _freeze_task_assets(task_id: str, settings_snapshot: dict, watermark_snapshot: dict, temp_base: str) -> None:
-    """Copy the thumbnail/watermark-font this task depends on into a folder owned
-    by the task, and rewrite the paths in `settings_snapshot`/`watermark_snapshot`
-    in place to point there.
+def _freeze_task_assets(task_id: str, settings_snapshot: dict, temp_base: str) -> None:
+    """Copy the thumbnail this task depends on into a folder owned by the
+    task, and rewrite the path in `settings_snapshot` in place to point
+    there.
 
-    IMPORTANT: this must be called on the per-task settings/watermark snapshot
+    IMPORTANT: this must be called on the per-task settings snapshot
     *before* `_build_task`/`task_queue.create_task` — i.e. before the task exists
     in the queue or has been checkpointed — so the task is enqueued already in its
     final, immutable form instead of being queued first and mutated afterward.
@@ -382,22 +363,6 @@ def _freeze_task_assets(task_id: str, settings_snapshot: dict, watermark_snapsho
             # Path no longer exists (e.g. cleared/replaced between settings capture
             # and freeze) - don't let a dangling path leak into the queued task.
             settings_snapshot["thumbnail_path"] = ""
-
-    if isinstance(watermark_snapshot, dict):
-        source_font = str(watermark_snapshot.get("font_path") or "")
-        if source_font:
-            if os.path.isfile(source_font):
-                os.makedirs(task_folder, exist_ok=True)
-                ext = os.path.splitext(source_font)[1] or ".ttf"
-                frozen_font = os.path.join(task_folder, f"watermark_font_{task_id}{ext}")
-                try:
-                    shutil.copy2(source_font, frozen_font)
-                    watermark_snapshot["font_path"] = os.path.abspath(frozen_font)
-                except Exception:
-                    logger.exception("[rename] Could not freeze watermark font for task %s", task_id)
-                    watermark_snapshot["font_path"] = ""
-            else:
-                watermark_snapshot["font_path"] = ""
 
 
 async def _process_single_rename(
@@ -457,17 +422,11 @@ async def _process_single_rename(
     user_id      = message.from_user.id
     settings_obj = user_settings(user_id)
     settings         = copy.deepcopy(settings_obj.get())
-    watermark        = copy.deepcopy(settings_obj.get_watermark())
     caption_template = settings_obj.get_caption_template()
 
     created_at = datetime.utcnow().isoformat()
-
-    # Reserve the id up front so assets can be frozen into a task-owned folder
-    # *before* the task is built and queued (no await happens between the settings
-    # snapshot above and this freeze, so there's no window for the live thumbnail/
-    # font to change out from under us).
     task_id = uuid.uuid4().hex
-    _freeze_task_assets(task_id, settings, watermark, temp_base)
+    _freeze_task_assets(task_id, settings, temp_base)
 
     task_data = _build_task(
         task_id=task_id,
@@ -479,7 +438,6 @@ async def _process_single_rename(
         source_thumbnail_file_id=_source_thumbnail_file_id(replied),
         output_filename=filename,
         settings=settings,
-        watermark=watermark,
         caption_template=caption_template,
         created_at=created_at,
         batch=False,
@@ -549,10 +507,9 @@ async def _process_batch_rename(
     user_id      = message.from_user.id
     settings_obj = user_settings(user_id)
     settings         = copy.deepcopy(settings_obj.get())
-    watermark        = copy.deepcopy(settings_obj.get_watermark())
     caption_template = settings_obj.get_caption_template()
 
-    enqueue_snapshot_dir = _snapshot_enqueue_assets(settings, watermark, temp_base)
+    enqueue_snapshot_dir = _snapshot_enqueue_assets(settings, temp_base)
     try:
         episode_raw = str(settings.get("default_start_episode", "1"))
         ep_width    = max(len(episode_raw), 2)
@@ -652,15 +609,14 @@ async def _process_batch_rename(
             output_filename = _resolve_template(template, ep_str)
             file_id, original_file_name, file_size = _file_info(mg_msg)
 
-            # `settings`/`watermark` here already point at the shared, pre-fetch
+            # `settings` here already points at the shared, pre-fetch
             # snapshot dir (see `_snapshot_enqueue_assets` above) rather than the
             # user's live, mutable files. Each task still gets its own deep copy
             # and its own frozen, task-owned asset files before it's ever built or
             # queued.
             task_id = uuid.uuid4().hex
             task_settings = copy.deepcopy(settings)
-            task_watermark = copy.deepcopy(watermark)
-            _freeze_task_assets(task_id, task_settings, task_watermark, temp_base)
+            _freeze_task_assets(task_id, task_settings, temp_base)
 
             task_data = _build_task(
                 task_id=task_id,
@@ -672,7 +628,6 @@ async def _process_batch_rename(
                 source_thumbnail_file_id=_source_thumbnail_file_id(mg_msg),
                 output_filename=output_filename,
                 settings=task_settings,
-                watermark=task_watermark,
                 caption_template=caption_template,
                 created_at=created_at,
                 batch=True,

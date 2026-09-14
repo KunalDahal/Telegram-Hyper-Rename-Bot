@@ -3,12 +3,14 @@ import os
 from pyrogram import Client
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
-from src.utils.commands import command_filter, chat_scope_filter
+from src.utils.commands import command_filter, command_text, chat_scope_filter
 
 
 def setup_set_handlers(app: Client, user_settings, config, access_control):
 
     allowed_filter = chat_scope_filter(config)
+    ss_cmd = command_text(config, "ss")
+    st_cmd = command_text(config, "st")
 
     @app.on_message(command_filter(config, ["ss", "set_start_episode"]) & allowed_filter)
     async def set_start_episode_command(client: Client, message: Message):
@@ -19,8 +21,8 @@ def setup_set_handlers(app: Client, user_settings, config, access_control):
             await message.reply_text(
                 "<b>▸ Usage</b>\n"
                 "────────────────\n"
-                "<blockquote><code>/ss &lt;episode&gt;</code></blockquote>\n"
-                "<i>Example:</i> <code>/ss 001</code>",
+                f"<blockquote><code>{ss_cmd} &lt;episode&gt;</code></blockquote>\n"
+                f"<i>Example:</i> <code>{ss_cmd} 001</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -55,7 +57,7 @@ def setup_set_handlers(app: Client, user_settings, config, access_control):
             await message.reply_text(
                 "<b>▸ Usage</b>\n"
                 "────────────────\n"
-                "Reply to a photo with <code>/st2</code> to set it as your thumbnail.",
+                f"Reply to a photo with <code>{st_cmd}</code> to set it as your thumbnail.",
                 parse_mode=ParseMode.HTML,
             )
             return

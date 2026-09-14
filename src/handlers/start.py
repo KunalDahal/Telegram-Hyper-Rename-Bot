@@ -52,7 +52,7 @@ def _help_pages(config, show_sudo: bool) -> list[tuple[str, str]]:
             f"<code>{cmd('es')}</code> → Open your settings menu.\n"
             f"<code>{cmd('ss')} 001</code> → Set the starting episode number.\n"
             f"<code>{cmd('st')}</code> → Reply to an image to save it as your thumbnail.\n\n"
-            f"<blockquote><i>Delivery caption, thumbnail, metadata, and watermark are all "
+            f"<blockquote><i>Delivery caption, thumbnail, and metadata are all "
             f"configurable from {cmd('es')}.</i></blockquote>"
         )),
         ("▸ Tasks", (

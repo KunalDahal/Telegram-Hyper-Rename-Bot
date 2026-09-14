@@ -7,6 +7,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.types import Message
 
 from src.utils.commands import command_filter, chat_scope_filter
+from src.utils.safe_path import safe_join
 from src.utils.telegraphpage import MediaInfoHelper
 
 _telegraph = MediaInfoHelper()
@@ -47,9 +48,9 @@ async def _handle_mi_command(client, message: Message, access_control):
 
     filename  = getattr(media, "file_name", None) or f"file_{media.file_id[:8]}"
     tmp_dir   = f"/tmp/mi_{uuid.uuid4().hex}"
-    save_path = os.path.join(tmp_dir, filename)
 
     os.makedirs(tmp_dir, exist_ok=True)
+    save_path = safe_join(tmp_dir, filename, fallback=f"file_{media.file_id[:8]}")
     status_msg = await message.reply_text(
         "<b>▸ Downloading</b>\n"
         "────────────────\n"

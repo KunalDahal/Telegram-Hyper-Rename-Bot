@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import uuid
 from collections import deque
 from copy import deepcopy
 from datetime import datetime
 
 from src.utils.dc_checker import get_file_dc
+
+logger = logging.getLogger(__name__)
 
 _ACTIVE_STATUSES = frozenset({
     "starting", "queued", "staging_to_dump", "waiting_for_download", "downloading",
@@ -51,7 +54,10 @@ class TaskQueue:
                 try:
                     await previous
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Previous checkpoint for task %s failed; continuing with the next checkpoint anyway.",
+                        task_id,
+                    )
             await self.task_store.save_active(snapshot)
 
         try:
@@ -164,7 +170,10 @@ class TaskQueue:
                     try:
                         await own_pending_checkpoint
                     except Exception:
-                        pass
+                        logger.exception(
+                            "Pending checkpoint for task %s failed before archiving; archiving anyway.",
+                            task_id,
+                        )
                 await self.task_store.archive(snapshot, final_status, error)
 
             self._schedule_store(archive_after_checkpoints())

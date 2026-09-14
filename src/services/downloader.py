@@ -4,6 +4,7 @@ import time
 import logging
 
 from src.services.hyper_downloader import HyperTGDownloader
+from src.utils.safe_path import safe_join
 
 
 MAX_DOWNLOAD_ATTEMPTS = 3
@@ -43,7 +44,11 @@ class Downloader:
 
         task_folder = os.path.join(self.temp_base, task_id)
         os.makedirs(task_folder, exist_ok=True)
-        desired_path = os.path.abspath(os.path.join(task_folder, original_file_name))
+        # original_file_name is attacker-controlled (it's the file_name
+        # attribute Telegram reports for the source media), so it must never
+        # be joined into a path unsanitized - a name like "../../etc/foo"
+        # would otherwise let a sender pick where on disk we write to.
+        desired_path = safe_join(task_folder, original_file_name, fallback=f"video_{task_id}.mkv")
 
         self._reset_progress()
         self.download_progress["status"] = "downloading"

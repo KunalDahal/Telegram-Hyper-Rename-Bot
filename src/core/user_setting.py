@@ -1,11 +1,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
-import uuid
 from copy import deepcopy
 from typing import Any, Dict
 
@@ -15,29 +15,6 @@ from .user_settings_store import UserSettingsStore, UserSettingsStoreError
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_WATERMARK = {
-    "enabled": False,
-    "text": "",
-    "color": "white",
-    "font_path": "",
-    "font_name": "default",
-    "font_size": 24,
-    "padding": 7,
-    "timing_mode": "range",
-    "start": 0,
-    "end": 0,
-    "duration": 30,
-    "repeat_count": 1,
-    "position": "bot_right",
-}
-
-VALID_WM_POSITIONS = {
-    "top_left", "top_mid", "top_right",
-    "mid_left", "mid_right",
-    "bot_left", "bot_right",
-}
-
-VALID_WM_TIMING_MODES = {"full", "range", "random_duration"}
 VALID_SEND_TYPES = {"media", "document"}
 
 DEFAULT_METADATA = {
@@ -49,27 +26,6 @@ DEFAULT_METADATA = {
 }
 
 DEFAULT_CAPTION_TEMPLATE = "<b>{filename}</b>"
-
-
-def _extract_font_name(font_path: str) -> str:
-    try:
-        from fontTools.ttLib import TTFont
-
-        tt = TTFont(font_path, fontNumber=0)
-        name_table = tt["name"]
-        for name_id in (4, 1):
-            record = name_table.getName(name_id, 3, 1, 0x0409)
-            if record:
-                return record.toUnicode().strip()
-        for record in name_table.names:
-            if record.nameID == 4:
-                try:
-                    return record.toUnicode().strip()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return os.path.splitext(os.path.basename(font_path))[0]
 
 
 class UserSettings:
@@ -93,6 +49,11 @@ class UserSettings:
 
         self.storage_path = os.path.join(self.db_folder, f"{self.user_id}.json")
         self.data: Dict[str, Any] = {}
+        # Monotonic counter used to detect a set_thumbnail() call that has
+        # been superseded by a newer one (or by clear_thumbnail()) before
+        # its background upload finished - see set_thumbnail() for how
+        # this is used.
+        self._thumbnail_op_seq = 0
         self._load()
 
     @property
@@ -148,38 +109,7 @@ class UserSettings:
         self.data["custom_caption"] = str(self.data.get("custom_caption") or "").strip()
         self.data["caption_disabled"] = self._as_bool(self.data.get("caption_disabled", False))
 
-        watermark = self.data.get("watermark")
-        if not isinstance(watermark, dict):
-            watermark = {}
-        for key, value in DEFAULT_WATERMARK.items():
-            watermark.setdefault(key, value)
-        watermark["enabled"] = self._as_bool(watermark["enabled"])
-        watermark["text"] = str(watermark["text"] or "")
-        watermark["color"] = (
-            str(watermark["color"]).lower()
-            if str(watermark["color"]).lower() in {"white", "black"}
-            else "white"
-        )
-        watermark["timing_mode"] = (
-            str(watermark["timing_mode"])
-            if str(watermark["timing_mode"]) in VALID_WM_TIMING_MODES
-            else DEFAULT_WATERMARK["timing_mode"]
-        )
-        watermark["position"] = (
-            str(watermark["position"])
-            if str(watermark["position"]) in VALID_WM_POSITIONS
-            else DEFAULT_WATERMARK["position"]
-        )
-        for key, minimum, maximum in (
-            ("font_size", 8, 96),
-            ("padding", 0, 30),
-            ("start", 0, 86_400),
-            ("end", 0, 86_400),
-            ("duration", 1, 3_600),
-            ("repeat_count", 1, 20),
-        ):
-            watermark[key] = self._clamp_int(watermark[key], minimum, maximum)
-        self.data["watermark"] = watermark
+        self.data.pop("watermark", None)
 
         self.data.setdefault("format", "{title} S{season}E{episode} [{quality}] [{audio}].mkv")
         self.data["default_start_episode"] = self._positive_number_string(
@@ -225,16 +155,6 @@ class UserSettings:
             else:
                 self.data["thumbnail_path"] = ""
 
-        watermark = self.data["watermark"]
-        font_id = str(watermark.get("font_asset_id") or "")
-        if font_id:
-            suffix = os.path.splitext(str(watermark.get("font_asset_name") or "font.ttf"))[1] or ".ttf"
-            font_path = os.path.join(self.fonts_folder, f"font_{self.user_id}{suffix}")
-            if self.store.restore_asset(font_id, font_path):
-                watermark["font_path"] = os.path.abspath(font_path)
-            else:
-                watermark["font_path"] = ""
-
     def _migrate_legacy_assets(self) -> None:
         if not self.store:
             return
@@ -247,17 +167,6 @@ class UserSettings:
             except UserSettingsStoreError:
                 logger.exception("Could not migrate thumbnail for user %s", self.user_id)
 
-        watermark = self.data["watermark"]
-        font_path = str(watermark.get("font_path") or "")
-        if font_path and os.path.isfile(font_path) and not watermark.get("font_asset_id"):
-            try:
-                watermark["font_asset_id"] = self.store.upload_asset(
-                    self.user_id, "watermark_font", font_path
-                )
-                watermark["font_asset_name"] = os.path.basename(font_path)
-            except UserSettingsStoreError:
-                logger.exception("Could not migrate watermark font for user %s", self.user_id)
-
     def _save_legacy_file(self) -> None:
         try:
             with open(self.storage_path, "w", encoding="utf-8") as target:
@@ -266,13 +175,34 @@ class UserSettings:
             logger.exception("Could not write local settings fallback for user %s", self.user_id)
 
     def _save(self) -> None:
-        if self.store:
-            try:
-                self.store.save(self.user_id, self.data)
-                return
-            except UserSettingsStoreError:
-                logger.exception("Could not save settings for user %s to MongoDB", self.user_id)
-        self._save_legacy_file()
+        """Persist the current settings. When a Mongo store is configured,
+        the network write is offloaded to the store's background thread
+        (see UserSettingsStore.save_async) so this never blocks the
+        caller's event loop."""
+        self._save_then(None)
+
+    def _save_then(self, on_saved) -> None:
+        """Like _save(), but also calls on_saved(mongo_ok: bool) once the
+        write finishes - from the background I/O thread if a store is
+        configured, or immediately if it isn't. Callers that must not
+        delete a superseded GridFS asset until they know the settings
+        document pointing at its replacement was actually saved (see
+        set_thumbnail/clear_thumbnail below) should use this instead of
+        _save().
+        """
+        if not self.store:
+            self._save_legacy_file()
+            if on_saved:
+                on_saved(False)
+            return
+
+        def _callback(ok: bool) -> None:
+            if not ok:
+                self._save_legacy_file()
+            if on_saved:
+                on_saved(ok)
+
+        self.store.save_async(self.user_id, self.data, callback=_callback)
 
     def _get_default_settings(self) -> Dict[str, Any]:
         return {
@@ -282,7 +212,6 @@ class UserSettings:
             "metadata": deepcopy(DEFAULT_METADATA),
             "thumbnail_path": "",
             "thumbnail_asset_id": "",
-            "watermark": deepcopy(DEFAULT_WATERMARK),
             "format": "{title} S{season}E{episode} [{quality}] [{audio}].mkv",
             "default_start_episode": 1,
             "default_season": 1,
@@ -302,63 +231,6 @@ class UserSettings:
     def reset(self) -> None:
         self._delete_assets()
         self.data = self._get_default_settings()
-        self._save()
-
-    def get_watermark(self) -> Dict[str, Any]:
-        self._normalize()
-        return deepcopy(self.data["watermark"])
-
-    def update_watermark(self, **kwargs) -> None:
-        self._normalize()
-        watermark = self.data["watermark"]
-        for key, value in kwargs.items():
-            if key in DEFAULT_WATERMARK:
-                watermark[key] = value
-        self._normalize()
-        self._save()
-
-    def set_watermark_font(self, tmp_path: str) -> str:
-        if not tmp_path or not os.path.exists(tmp_path):
-            return "default"
-        extension = os.path.splitext(tmp_path)[1].lower()
-        if extension not in (".ttf", ".otf"):
-            return "default"
-
-        font_filename = f"font_{self.user_id}_{uuid.uuid4().hex[:8]}{extension}"
-        destination = os.path.abspath(os.path.join(self.fonts_folder, font_filename))
-        shutil.copy2(tmp_path, destination)
-        self._normalize()
-        watermark = self.data["watermark"]
-        previous_asset_id = str(watermark.get("font_asset_id") or "")
-        if self.store:
-            try:
-                watermark["font_asset_id"] = self.store.upload_asset(
-                    self.user_id, "watermark_font", destination, previous_asset_id
-                )
-                watermark["font_asset_name"] = font_filename
-            except UserSettingsStoreError:
-                logger.exception("Could not persist watermark font for user %s", self.user_id)
-
-        old_path = str(watermark.get("font_path") or "")
-        fonts_root = os.path.abspath(self.fonts_folder)
-        if old_path and old_path != destination and os.path.exists(old_path) and os.path.abspath(old_path).startswith(fonts_root):
-            try:
-                os.remove(old_path)
-            except OSError:
-                pass
-
-        font_name = _extract_font_name(destination)
-        watermark["font_path"] = destination
-        watermark["font_name"] = font_name
-        self._save()
-        return font_name
-
-    def reset_watermark(self) -> None:
-        watermark = self.get_watermark()
-        self._remove_local_file(str(watermark.get("font_path") or ""), self.fonts_folder)
-        if self.store:
-            self.store.delete_asset(str(watermark.get("font_asset_id") or ""))
-        self.data["watermark"] = deepcopy(DEFAULT_WATERMARK)
         self._save()
 
     def update_metadata(
@@ -388,27 +260,77 @@ class UserSettings:
         destination = os.path.abspath(os.path.join(self.thumbnails_folder, f"thumb_{self.user_id}.jpg"))
         shutil.copy2(path, destination)
         previous_asset_id = str(self.data.get("thumbnail_asset_id") or "")
-        if self.store:
-            try:
-                self.data["thumbnail_asset_id"] = self.store.upload_asset(
-                    self.user_id, "thumbnail", destination, previous_asset_id
-                )
-            except UserSettingsStoreError:
-                logger.exception("Could not persist thumbnail for user %s", self.user_id)
-        self.data["thumbnail_path"] = destination
-        self._save()
+
+        if not self.store:
+            self.data["thumbnail_path"] = destination
+            self._save()
+            return
+
+        # Claim this as the latest in-flight thumbnail operation. Any
+        # earlier set_thumbnail()/clear_thumbnail() call whose background
+        # upload/save is still pending is now stale and must not be
+        # allowed to overwrite what we're about to apply.
+        self._thumbnail_op_seq += 1
+        my_seq = self._thumbnail_op_seq
+        loop = asyncio.get_event_loop()
+
+        def _apply_uploaded(ok: bool, new_asset_id: str) -> None:
+            # Runs on the asyncio/main thread (see call_soon_threadsafe
+            # below) - self.data is only ever mutated here, never from the
+            # background I/O thread, so a slow/older call can't race a
+            # newer one for the write.
+            if my_seq != self._thumbnail_op_seq:
+                # Superseded while the upload was in flight: drop the
+                # result instead of reviving stale state, and don't leave
+                # the freshly uploaded asset orphaned in GridFS.
+                if ok and new_asset_id:
+                    self.store.delete_asset_async(new_asset_id)
+                return
+
+            if ok:
+                self.data["thumbnail_asset_id"] = new_asset_id
+            else:
+                logger.error("Could not persist thumbnail for user %s", self.user_id)
+            self.data["thumbnail_path"] = destination
+
+            def _on_saved(mongo_ok: bool) -> None:
+                # Only delete the superseded GridFS asset once we know the
+                # settings document pointing at its replacement actually
+                # landed in Mongo - otherwise a failed save here would
+                # leave Mongo pointing at an asset we've already deleted.
+                if mongo_ok and ok and previous_asset_id and previous_asset_id != new_asset_id:
+                    self.store.delete_asset(previous_asset_id)
+
+            self._save_then(_on_saved)
+
+        def _on_uploaded(ok: bool, new_asset_id: str) -> None:
+            # Runs on the background I/O thread - hand the result back to
+            # the main thread instead of touching self.data here.
+            loop.call_soon_threadsafe(_apply_uploaded, ok, new_asset_id)
+
+        self.store.upload_asset_async(self.user_id, "thumbnail", destination, _on_uploaded)
 
     def clear_thumbnail(self) -> None:
         self._remove_local_file(str(self.data.get("thumbnail_path") or ""), self.thumbnails_folder)
-        if self.store:
-            self.store.delete_asset(str(self.data.get("thumbnail_asset_id") or ""))
+        previous_asset_id = str(self.data.get("thumbnail_asset_id") or "")
+        # Supersede any set_thumbnail() upload still in flight so its
+        # eventual result can't reapply the thumbnail we're clearing here.
+        self._thumbnail_op_seq += 1
         self.data["thumbnail_asset_id"] = ""
         self.data["thumbnail_path"] = ""
-        self._save()
+
+        if not self.store:
+            self._save()
+            return
+
+        def _on_saved(mongo_ok: bool) -> None:
+            if mongo_ok and previous_asset_id:
+                self.store.delete_asset(previous_asset_id)
+
+        self._save_then(_on_saved)
 
     def _delete_assets(self) -> None:
         self.clear_thumbnail()
-        self.reset_watermark()
 
     @staticmethod
     def _remove_local_file(path: str, allowed_folder: str) -> None:

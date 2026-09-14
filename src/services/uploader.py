@@ -7,6 +7,7 @@ from html import escape
 from pyrogram.enums import ParseMode
 
 from src.utils.retry import call_with_flood_retry
+from src.utils.safe_path import safe_join
 
 MAX_NON_PREMIUM_BYTES = int(1.95 * 1024 ** 3)
 MAX_PREMIUM_BYTES = int(3.95 * 1024 ** 3)
@@ -90,7 +91,7 @@ class Uploader:
                 raise Exception("No media file found in task folder")
 
             current_file = os.path.join(task_folder, media_files[0])
-            final_file_path = os.path.join(task_folder, output_file_name)
+            final_file_path = safe_join(task_folder, output_file_name, fallback=media_files[0])
             if current_file != final_file_path:
                 shutil.move(current_file, final_file_path)
 
@@ -320,7 +321,7 @@ class Uploader:
         with open(file_path, "rb") as src:
             while True:
                 part_name = f"{base} P{idx}{ext}"
-                part_path = os.path.join(task_folder, part_name)
+                part_path = safe_join(task_folder, part_name, fallback=f"part_{idx}{ext}")
                 written = 0
 
                 with open(part_path, "wb") as dst:

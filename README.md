@@ -6,7 +6,7 @@ file in your private chat with the bot.
 
 The bot is designed for rename workflows: it preserves the source streams where
 possible, while still supporting metadata, custom thumbnails, MediaInfo,
-watermarks, and ordered batch processing.
+and ordered batch processing.
 
 ## What it can do
 
@@ -14,7 +14,7 @@ watermarks, and ordered batch processing.
 - Rename a Telegram media album or a sequence of up to 150 messages.
 - Build batch names with `{season}` and `{episode}`, including zero-padded
   episode numbers.
-- Save per-user settings, thumbnails, and watermark fonts in MongoDB.
+- Save per-user settings and thumbnails in MongoDB.
 - Add title, author, artist, encoder, and other metadata without unnecessary
   video re-encoding.
 - Generate a Telegraph-hosted MediaInfo page from a replied media file.
@@ -44,7 +44,7 @@ available so anyone can check what Premium unlocks and whether they have it.
 | `/rename <filename>` | `/r <filename>` | Reply to one video and queue a rename. If the filename is omitted, the original name is retained. |
 | `/rename -b <template>` | `/r -b <template>` | Reply to the first item of a media album and batch-rename it. |
 | `/rename -b <count> <template>` | `/r -b <count> <template>` | Rename the next 2–150 messages beginning at the replied file. |
-| `/es` | `/us`, `/settings`, `/usersettings` | Open personal rename, metadata, thumbnail, send-mode, and watermark settings. |
+| `/es` | `/us`, `/settings`, `/usersettings` | Open personal rename, metadata, thumbnail, and send-mode settings. |
 | `/ss <episode>` | `/set_start_episode <episode>` | Set the starting episode number for batch names; `/ss 001` preserves the padding. |
 | `/st` | `/setthumb` | Reply to an image to save it as your output thumbnail. |
 | `/set_caption <caption>` | — | Set a custom delivery caption. Use `{filename}` as a placeholder for the output filename. Defaults to `<code>{filename}</code>`. |
@@ -221,7 +221,7 @@ docker compose logs -f
 
 The compose configuration persists `src/bin` for local logs and active work
 files. MongoDB stores Premium/banned users, user settings, thumbnails,
-watermark fonts, and task records.
+and task records.
 
 ## Heroku deployment
 
@@ -248,7 +248,7 @@ names; it does not make duplicate workers for a token safe.
 
 Heroku's filesystem is ephemeral. Downloaded work files are not durable across
 a dyno replacement, but MongoDB-backed Premium/banned users, user settings,
-thumbnails, watermark fonts, and task records persist.
+thumbnails, and task records persist.
 
 ## Premium download session
 

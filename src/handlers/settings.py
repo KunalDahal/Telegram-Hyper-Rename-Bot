@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 import os
@@ -9,7 +11,24 @@ from src.core.user_setting import DEFAULT_CAPTION_TEMPLATE
 CAPTION_PLACEHOLDER = "{filename}"
 _CAPTION_PREVIEW_NAME = "Sample.Movie.Name.S01E01.mkv"
 
-_settings_owner: dict[tuple[int, int], int] = {}
+_SETTINGS_OWNER_MAX = 2000
+_settings_owner: "OrderedDict[tuple[int, int], int]" = OrderedDict()
+
+
+def _set_settings_owner(chat_id: int, message_id: int, user_id: int) -> None:
+    key = (chat_id, message_id)
+    _settings_owner[key] = user_id
+    _settings_owner.move_to_end(key)
+    while len(_settings_owner) > _SETTINGS_OWNER_MAX:
+        _settings_owner.popitem(last=False)  # evict oldest
+
+
+def _get_settings_owner(chat_id: int, message_id: int) -> int | None:
+    key = (chat_id, message_id)
+    owner = _settings_owner.get(key)
+    if owner is not None:
+        _settings_owner.move_to_end(key)
+    return owner
 
 SETTINGS_IMAGE_URL = "https://i.ibb.co/RpZxdJwG/9a58b8252599bc747a0e0c7c6aa7c8b5.jpg"
 
@@ -23,16 +42,6 @@ METADATA_FIELDS = [
 
 METADATA_FIELD_BY_KEY = {key: (label, prompt) for key, label, prompt in METADATA_FIELDS}
 
-WM_POSITION_LABELS = {
-    "top_left":  "Top Left",
-    "top_mid":   "Top Mid",
-    "top_right": "Top Right",
-    "mid_left":  "Mid Left",
-    "mid_right": "Mid Right",
-    "bot_left":  "Bot Left",
-    "bot_right": "Bot Right",
-}
-
 def build_settings_text(
     name,
     username,
@@ -45,9 +54,6 @@ def build_settings_text(
     meta      = settings.get("metadata", {})
     meta_set  = any(meta.get(key) for key, _, _ in METADATA_FIELDS)
 
-    wm      = settings.get("watermark", {})
-    wm_on   = wm.get("enabled", False)
-
     ep = settings.get("default_start_episode", 1)
 
     cap_disabled = settings.get("caption_disabled", False)
@@ -55,7 +61,6 @@ def build_settings_text(
 
     thumb_status = "<u>Set</u>"     if has_thumb    else "<i>Unset</i>"
     meta_status  = "<u>Set</u>"     if meta_set     else "<i>Unset</i>"
-    wm_status    = "<u>Set</u>"     if wm_on        else "<i>Unset</i>"
     if cap_disabled:
         cap_status = "<i>Disabled</i>"
     elif cap_custom:
@@ -75,7 +80,6 @@ def build_settings_text(
         f"<b>Start Episode:</b>  <code>{ep}</code>\n"
         f"<b>Thumbnail:</b>  {thumb_status}\n"
         f"<b>Metadata:</b>  {meta_status}\n"
-        f"<b>Watermark:</b>  {wm_status}\n"
         f"<b>Caption:</b>  {cap_status}"
     )
 
@@ -83,69 +87,13 @@ def build_settings_text(
 def _split_limit_gib(premium_session_available: bool = False) -> float:
     return 3.95 if premium_session_available else 1.95
 
-def _secs_to_mmss(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-def _mmss_to_secs(mmss: str) -> int:
-    mmss = mmss.strip()
-    if ":" not in mmss:
-        return int(mmss)
-    parts = mmss.split(":", 1)
-    minutes = int(parts[0])
-    secs    = int(parts[1])
-    if not (0 <= secs < 60):
-        raise ValueError(f"Seconds component out of range: {secs}")
-    if minutes < 0:
-        raise ValueError(f"Minutes component negative: {minutes}")
-    return minutes * 60 + secs
-
-def build_watermark_text(wm: dict, subtitle: str = "") -> str:
-    enabled      = wm.get("enabled", False)
-    text         = wm.get("text", "") or "—"
-    color        = wm.get("color", "white").capitalize()
-    font_name    = wm.get("font_name", "default")
-    font_size    = wm.get("font_size", 24)
-    padding      = wm.get("padding", 7)
-    timing_mode  = wm.get("timing_mode", "range")
-    position     = WM_POSITION_LABELS.get(wm.get("position", "bot_right"), "Bot Right")
-    extra        = f"\n<i>{subtitle}</i>" if subtitle else ""
-
-    if timing_mode == "full":
-        timing_str = "Full Duration"
-    elif timing_mode == "range":
-        start_mmss = _secs_to_mmss(wm.get("start", 0))
-        end_mmss   = _secs_to_mmss(wm.get("end", 0))
-        timing_str = f"Range  <code>{start_mmss} → {end_mmss}</code>"
-    else:
-        repeat   = wm.get("repeat_count", 1)
-        duration = wm.get("duration", 30)
-        timing_str = (
-            f"Random  <code>{repeat}×</code> appearance(s), "
-            f"<code>{duration}s</code> each"
-        )
-
-    return (
-        f"<b>Watermark</b>{extra}\n\n"
-        f"Status    : {'Enabled' if enabled else 'Disabled'}\n"
-        f"Text      : <code>{text}</code>\n"
-        f"Color     : <code>{color}</code>\n"
-        f"Font      : <code>{font_name}</code>\n"
-        f"Font Size : <code>{font_size}px</code>\n"
-        f"Padding   : <code>{padding}%</code>\n"
-        f"Timing    : {timing_str}\n"
-        f"Position  : {position}\n\n"
-        "<blockquote><i>If nothing is available after the selected priority, no thumbnail is applied.</i></blockquote>"
-    )
-
 def build_main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Send Type",     callback_data="set_send_type"),
          InlineKeyboardButton("Thumbnail",     callback_data="set_thumbnail")],
         [InlineKeyboardButton("Metadata",      callback_data="set_metadata"),
          InlineKeyboardButton("Start Episode", callback_data="set_start_episode")],
-        [InlineKeyboardButton("Watermark",     callback_data="set_watermark"),
-         InlineKeyboardButton("Caption",       callback_data="set_caption")],
+        [InlineKeyboardButton("Caption",       callback_data="set_caption")],
         [InlineKeyboardButton("Reset All",     callback_data="reset_settings"),
          InlineKeyboardButton("Close",         callback_data="close_menu")],
     ])
@@ -181,73 +129,6 @@ def build_metadata_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("Back",      callback_data="back_to_menu"),
     ])
     return InlineKeyboardMarkup(rows)
-
-def build_watermark_keyboard(wm: dict) -> InlineKeyboardMarkup:
-    enabled    = wm.get("enabled", False)
-    toggle_lbl = "Enabled — tap to disable" if enabled else "Disabled — tap to enable"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(toggle_lbl,     callback_data="wm_toggle")],
-        [InlineKeyboardButton("Text",         callback_data="wm_set_text"),
-         InlineKeyboardButton("Color",        callback_data="wm_set_color")],
-        [InlineKeyboardButton("Font",         callback_data="wm_set_font"),
-         InlineKeyboardButton("Timing",       callback_data="wm_set_timing")],
-        [InlineKeyboardButton("Font Size",    callback_data="wm_set_font_size"),
-         InlineKeyboardButton("Padding",      callback_data="wm_set_padding")],
-        [InlineKeyboardButton("Position",     callback_data="wm_set_position")],
-        [InlineKeyboardButton("Back",         callback_data="back_to_menu"),
-         InlineKeyboardButton("Reset",        callback_data="wm_reset")],
-    ])
-
-def build_wm_color_keyboard(current: str) -> InlineKeyboardMarkup:
-    def lbl(c):
-        return f"[x] {c.capitalize()}" if c == current else c.capitalize()
-
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(lbl("white"), callback_data="wm_color_white"),
-         InlineKeyboardButton(lbl("black"), callback_data="wm_color_black")],
-        [InlineKeyboardButton("Back", callback_data="set_watermark")],
-    ])
-
-def build_wm_timing_keyboard(current_mode: str) -> InlineKeyboardMarkup:
-    def lbl(mode, label):
-        return f"[x] {label}" if mode == current_mode else label
-
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(lbl("full",            "Full Duration"),        callback_data="wm_timing_full")],
-        [InlineKeyboardButton(lbl("range",           "Start → End (MM:SS)"), callback_data="wm_timing_range")],
-        [InlineKeyboardButton(lbl("random_duration", "Random Duration"),      callback_data="wm_timing_random")],
-        [InlineKeyboardButton("Back", callback_data="set_watermark")],
-    ])
-
-def build_wm_random_keyboard(wm: dict) -> InlineKeyboardMarkup:
-    repeat   = wm.get("repeat_count", 1)
-    duration = wm.get("duration", 30)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"Appearances: {repeat}×",
-            callback_data="wm_random_count",
-        )],
-        [InlineKeyboardButton(
-            f"Duration per appearance: {duration}s",
-            callback_data="wm_random_duration",
-        )],
-        [InlineKeyboardButton("Back", callback_data="wm_set_timing")],
-    ])
-
-def build_wm_position_keyboard(current: str) -> InlineKeyboardMarkup:
-    def btn(key):
-        label = WM_POSITION_LABELS[key]
-        return InlineKeyboardButton(
-            f"[x] {label}" if key == current else label,
-            callback_data=f"wm_pos_{key}"
-        )
-
-    return InlineKeyboardMarkup([
-        [btn("top_left"),  btn("top_mid"),   btn("top_right")],
-        [btn("mid_left"),                    btn("mid_right")],
-        [btn("bot_left"),                    btn("bot_right")],
-        [InlineKeyboardButton("Back", callback_data="set_watermark")],
-    ])
 
 def build_cancel_keyboard(label: str = "Cancel") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -387,7 +268,7 @@ def setup_settings_handlers(
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
             )
-            _settings_owner[(chat_id, sent.id)] = user_id
+            _set_settings_owner(chat_id, sent.id, user_id)
         except Exception:
             await message.reply_text(
                 "<b>▸ Error</b>\n"
@@ -397,14 +278,14 @@ def setup_settings_handlers(
             )
 
     @app.on_callback_query(filters.regex(
-        r"^(set_|sendtype_|meta_|reset_|back_to|close_|wm_|cancel_input|settings_|thumb_|start_episode_|cap_)"
+        r"^(set_|sendtype_|meta_|reset_|back_to|close_|cancel_input|settings_|thumb_|start_episode_|cap_)"
     ))
     async def handle_settings_callbacks(client: Client, callback_query: CallbackQuery):
         user    = callback_query.from_user
         user_id = user.id
         data    = callback_query.data
         message = callback_query.message
-        owner   = _settings_owner.get((message.chat.id, message.id))
+        owner   = _get_settings_owner(message.chat.id, message.id)
         if owner is not None and owner != user_id:
             await callback_query.answer("This is not your settings menu.", show_alert=True)
             return
@@ -539,269 +420,6 @@ def setup_settings_handlers(
             await update_thumbnail_menu(client, message, user_id)
             return
 
-        elif data == "set_watermark":
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                build_watermark_text(wm),
-                reply_markup=build_watermark_keyboard(wm),
-                parse_mode=ParseMode.HTML
-            )
-            await callback_query.answer()
-            return
-
-        elif data == "wm_toggle":
-            us        = user_settings(user_id)
-            wm        = us.get_watermark()
-            new_state = not wm.get("enabled", False)
-            us.update_watermark(enabled=new_state)
-            wm = us.get_watermark()
-            await callback_query.answer("Watermark enabled" if new_state else "Watermark disabled")
-            await message.edit_text(
-                build_watermark_text(wm),
-                reply_markup=build_watermark_keyboard(wm),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        elif data == "wm_set_text":
-            sent_message = await message.edit_text(
-                "<b>Watermark Text</b>\n\n"
-                "Send the text to display on the video.\n"
-                "<i>Example: <code>My Channel</code></i>\n\n",
-                reply_markup=build_cancel_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
-            user_settings(user_id).temp_state[user_id] = {
-                "chat_id":            message.chat.id,
-                "settings_message_id": message.id,
-                "state":              "waiting_wm_text",
-                "prompt_message_id":  sent_message.id,
-                "back_to":            "watermark",
-            }
-            await callback_query.answer()
-            return
-
-        elif data == "wm_set_color":
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                "<b>Watermark Color</b>\n\nChoose the text color.",
-                reply_markup=build_wm_color_keyboard(wm.get("color", "white")),
-                parse_mode=ParseMode.HTML
-            )
-            await callback_query.answer()
-            return
-
-        elif data.startswith("wm_color_"):
-            color = data.replace("wm_color_", "")
-            if color in ("white", "black"):
-                user_settings(user_id).update_watermark(color=color)
-                await callback_query.answer(f"Color → {color.capitalize()}")
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                build_watermark_text(wm, f"Color set to {color}"),
-                reply_markup=build_watermark_keyboard(wm),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        elif data == "wm_set_font":
-            sent_message = await message.edit_text(
-                "<b>Watermark Font</b>\n\n"
-                "Send a <code>.ttf</code> or <code>.otf</code> font file.\n\n",
-                reply_markup=build_cancel_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
-            user_settings(user_id).temp_state[user_id] = {
-                "chat_id":            message.chat.id,
-                "settings_message_id": message.id,
-                "state":              "waiting_wm_font",
-                "prompt_message_id":  sent_message.id,
-                "back_to":            "watermark",
-            }
-            await callback_query.answer()
-            return
-
-        elif data == "wm_set_timing":
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                "<b>Watermark Timing</b>\n\n"
-                "<b>Full Duration</b>  —  Visible for the entire video.\n\n"
-                "<b>Start → End</b>  —  Visible between two timestamps in <code>MM:SS</code> format.\n\n"
-                "<b>Random Duration</b>  —  Appears N times at random non-overlapping points.",
-                reply_markup=build_wm_timing_keyboard(wm.get("timing_mode", "range")),
-                parse_mode=ParseMode.HTML
-            )
-            await callback_query.answer()
-            return
-
-        elif data == "wm_timing_full":
-            user_settings(user_id).update_watermark(timing_mode="full")
-            await callback_query.answer("Timing set to Full Duration")
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                build_watermark_text(wm, "Timing set to Full Duration"),
-                reply_markup=build_watermark_keyboard(wm),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        elif data == "wm_timing_range":
-            user_settings(user_id).update_watermark(timing_mode="range")
-            sent_message = await message.edit_text(
-                "<b>Set Start Time</b>\n\n"
-                "Send the <b>start time</b> in <code>MM:SS</code> format.\n"
-                "<i>Example: <code>01:30</code> for 1 minute 30 seconds.</i>\n\n"
-                "You can also send bare seconds, e.g. <code>90</code>.",
-                reply_markup=build_cancel_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
-            user_settings(user_id).temp_state[user_id] = {
-                "chat_id":            message.chat.id,
-                "settings_message_id": message.id,
-                "state":              "waiting_wm_range_start",
-                "prompt_message_id":  sent_message.id,
-                "back_to":            "watermark",
-            }
-            await callback_query.answer()
-            return
-
-        elif data == "wm_timing_random":
-            user_settings(user_id).update_watermark(timing_mode="random_duration")
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                "<b>Random Duration</b>\n\n"
-                "The watermark will appear at random non-overlapping points in the video.\n\n"
-                f"<b>Appearances:</b> <code>{wm.get('repeat_count', 1)}×</code>  "
-                "— how many times it should appear.\n"
-                f"<b>Duration each:</b> <code>{wm.get('duration', 30)}s</code>  "
-                "— how many seconds each appearance lasts.\n\n"
-                "<i>The video is divided into equal sections; one appearance is placed "
-                "randomly inside each section so they never overlap.</i>",
-                reply_markup=build_wm_random_keyboard(wm),
-                parse_mode=ParseMode.HTML
-            )
-            await callback_query.answer()
-            return
-
-        elif data == "wm_random_count":
-            wm = user_settings(user_id).get_watermark()
-            sent_message = await message.edit_text(
-                "<b>Number of Appearances</b>\n\n"
-                f"Current: <code>{wm.get('repeat_count', 1)}</code>\n\n"
-                "Send the number of times the watermark should appear in the video.\n"
-                "<i>Example: <code>3</code> means 3 separate appearances.</i>\n\n"
-                "Allowed range: <code>1 – 20</code>.",
-                reply_markup=build_cancel_keyboard("Cancel"),
-                parse_mode=ParseMode.HTML
-            )
-            user_settings(user_id).temp_state[user_id] = {
-                "chat_id":            message.chat.id,
-                "settings_message_id": message.id,
-                "state":              "waiting_wm_random_count",
-                "prompt_message_id":  sent_message.id,
-                "back_to":            "wm_random",
-            }
-            await callback_query.answer()
-            return
-
-        elif data == "wm_random_duration":
-            wm = user_settings(user_id).get_watermark()
-            sent_message = await message.edit_text(
-                "<b>Duration per Appearance</b>\n\n"
-                f"Current: <code>{wm.get('duration', 30)}s</code>\n\n"
-                "Send the number of <b>seconds</b> each appearance should stay visible.\n"
-                "<i>Example: <code>5</code> means each appearance lasts 5 seconds.</i>\n\n"
-                "Allowed range: <code>1 – 3600</code>.\n\n"
-                "<i>If the value is too long for the number of appearances, "
-                "it will be clamped automatically at encode time.</i>",
-                reply_markup=build_cancel_keyboard("Cancel"),
-                parse_mode=ParseMode.HTML
-            )
-            user_settings(user_id).temp_state[user_id] = {
-                "chat_id":            message.chat.id,
-                "settings_message_id": message.id,
-                "state":              "waiting_wm_duration",
-                "prompt_message_id":  sent_message.id,
-                "back_to":            "wm_random",
-            }
-            await callback_query.answer()
-            return
-
-        elif data == "wm_set_position":
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                "<b>Watermark Position</b>\n\n"
-                "Choose where the watermark appears on the frame.\n"
-                "<i>All positions use your configured padding % from the edge.</i>",
-                reply_markup=build_wm_position_keyboard(wm.get("position", "bot_right")),
-                parse_mode=ParseMode.HTML
-            )
-            await callback_query.answer()
-            return
-
-        elif data == "wm_set_font_size":
-            wm = user_settings(user_id).get_watermark()
-            sent_message = await message.edit_text(
-                "<b>Watermark Font Size</b>\n\n"
-                f"Current: <code>{wm.get('font_size', 24)}px</code>\n\n"
-                "Send a font size between <code>8</code> and <code>96</code>.\n\n",
-                reply_markup=build_cancel_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
-            user_settings(user_id).temp_state[user_id] = {
-                "chat_id":            message.chat.id,
-                "settings_message_id": message.id,
-                "state":              "waiting_wm_font_size",
-                "prompt_message_id":  sent_message.id,
-                "back_to":            "watermark",
-            }
-            await callback_query.answer()
-            return
-
-        elif data == "wm_set_padding":
-            wm = user_settings(user_id).get_watermark()
-            sent_message = await message.edit_text(
-                "<b>Watermark Padding</b>\n\n"
-                f"Current: <code>{wm.get('padding', 7)}%</code>\n\n"
-                "Send a whole number between <code>1</code> and <code>25</code>.\n\n",
-                reply_markup=build_cancel_keyboard(),
-                parse_mode=ParseMode.HTML
-            )
-            user_settings(user_id).temp_state[user_id] = {
-                "chat_id":            message.chat.id,
-                "settings_message_id": message.id,
-                "state":              "waiting_wm_padding",
-                "prompt_message_id":  sent_message.id,
-                "back_to":            "watermark",
-            }
-            await callback_query.answer()
-            return
-
-        elif data.startswith("wm_pos_"):
-            pos = data.replace("wm_pos_", "")
-            if pos in WM_POSITION_LABELS:
-                user_settings(user_id).update_watermark(position=pos)
-                label = WM_POSITION_LABELS[pos]
-                await callback_query.answer(f"Position → {label}")
-                wm = user_settings(user_id).get_watermark()
-                await message.edit_text(
-                    build_watermark_text(wm, f"Position set to {label}"),
-                    reply_markup=build_watermark_keyboard(wm),
-                    parse_mode=ParseMode.HTML
-                )
-            return
-
-        elif data == "wm_reset":
-            user_settings(user_id).reset_watermark()
-            await callback_query.answer("Watermark reset to defaults")
-            wm = user_settings(user_id).get_watermark()
-            await message.edit_text(
-                build_watermark_text(wm, "Reset to defaults"),
-                reply_markup=build_watermark_keyboard(wm),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
         elif data == "set_caption":
             settings = user_settings(user_id).get()
             await message.edit_text(
@@ -897,38 +515,7 @@ def setup_settings_handlers(
             us.temp_state.pop(user_id, None)
             await callback_query.answer("Cancelled")
 
-            if back_to == "watermark":
-                wm = us.get_watermark()
-                await message.edit_text(
-                    build_watermark_text(wm),
-                    reply_markup=build_watermark_keyboard(wm),
-                    parse_mode=ParseMode.HTML
-                )
-            elif back_to == "wm_random":
-                wm = us.get_watermark()
-                await message.edit_text(
-                    "<b>Random Duration</b>\n\n"
-                    "The watermark will appear at random non-overlapping points in the video.\n\n"
-                    f"<b>Appearances:</b> <code>{wm.get('repeat_count', 1)}×</code>  "
-                    "— how many times it should appear.\n"
-                    f"<b>Duration each:</b> <code>{wm.get('duration', 30)}s</code>  "
-                    "— how many seconds each appearance lasts.\n\n"
-                    "<i>The video is divided into equal sections; one appearance is placed "
-                    "randomly inside each section so they never overlap.</i>",
-                    reply_markup=build_wm_random_keyboard(wm),
-                    parse_mode=ParseMode.HTML
-                )
-            elif back_to == "wm_timing":
-                wm = us.get_watermark()
-                await message.edit_text(
-                    "<b>Watermark Timing</b>\n\n"
-                    "<b>Full Duration</b>  —  Visible for the entire video.\n\n"
-                    "<b>Start → End</b>  —  Visible between two timestamps in <code>MM:SS</code> format.\n\n"
-                    "<b>Random Duration</b>  —  Appears N times at random non-overlapping points.",
-                    reply_markup=build_wm_timing_keyboard(wm.get("timing_mode", "range")),
-                    parse_mode=ParseMode.HTML
-                )
-            elif back_to == "metadata":
+            if back_to == "metadata":
                 meta = user_settings(user_id).get().get("metadata", {})
                 await message.edit_text(
                     build_metadata_text(meta),
@@ -973,6 +560,13 @@ def setup_settings_handlers(
         await callback_query.answer()
 
     async def update_thumbnail_menu(client, message, user_id, subtitle=""):
+        # `message` can be the result of a get_messages() re-fetch of a
+        # message that's since been deleted - Pyrogram/wzgram represents
+        # that as an "empty" Message (chat=None) rather than returning
+        # None, so guard explicitly instead of touching message.chat.id.
+        if message is None or getattr(message, "empty", False) or message.chat is None:
+            return None
+
         settings       = user_settings(user_id).get()
         text           = build_thumbnail_text(settings, subtitle)
         keyboard       = build_thumbnail_keyboard(settings)
@@ -993,7 +587,7 @@ def setup_settings_handlers(
                     chat_id=chat_id, photo=photo_source, caption=text,
                     reply_markup=keyboard, parse_mode=ParseMode.HTML
                 )
-                _settings_owner[(chat_id, sent.id)] = user_id
+                _set_settings_owner(chat_id, sent.id, user_id)
                 return sent
         except Exception:
             try:
@@ -1001,7 +595,7 @@ def setup_settings_handlers(
                     chat_id=chat_id, photo=photo_source, caption=text,
                     reply_markup=keyboard, parse_mode=ParseMode.HTML
                 )
-                _settings_owner[(chat_id, sent.id)] = user_id
+                _set_settings_owner(chat_id, sent.id, user_id)
                 return sent
             except Exception:
                 return None
@@ -1038,14 +632,14 @@ def setup_settings_handlers(
                     reply_markup=keyboard,
                     parse_mode=ParseMode.HTML
                 )
-                _settings_owner[(chat_id, sent.id)] = user_id
+                _set_settings_owner(chat_id, sent.id, user_id)
         except Exception:
             try:
                 sent = await client.send_photo(
                     chat_id=chat_id, photo=photo_source, caption=text,
                     reply_markup=keyboard, parse_mode=ParseMode.HTML
                 )
-                _settings_owner[(chat_id, sent.id)] = user_id
+                _set_settings_owner(chat_id, sent.id, user_id)
             except Exception:
                 pass
 
@@ -1097,7 +691,7 @@ def setup_settings_handlers(
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML,
             )
-            _settings_owner[(chat_id, sent.id)] = user_id
+            _set_settings_owner(chat_id, sent.id, user_id)
 
         if state == "waiting_meta_all":
             value = message.text.strip()
@@ -1198,179 +792,6 @@ def setup_settings_handlers(
                 build_caption_keyboard(),
             )
 
-        elif state == "waiting_wm_text":
-            text_val = message.text.strip()
-            if text_val:
-                us.update_watermark(text=text_val)
-                del us.temp_state[user_id]
-                await _cleanup()
-                wm = us.get_watermark()
-                await _edit_settings(
-                    build_watermark_text(wm, "Text updated"),
-                    build_watermark_keyboard(wm),
-                )
-            else:
-                await message.reply_text(
-                    "<b>▸ Empty Value</b>\n"
-                    "────────────────\n"
-                    "<i>Text cannot be empty.</i>",
-                    parse_mode=ParseMode.HTML,
-                )
-
-        elif state == "waiting_wm_range_start":
-            try:
-                start = _mmss_to_secs(message.text)
-                if start < 0:
-                    raise ValueError
-                us.update_watermark(start=start)
-                await _cleanup()
-                start_mmss = _secs_to_mmss(start)
-                sent = await client.send_message(
-                    chat_id,
-                    f"<b>Set End Time</b>\n\n"
-                    f"Start is set to <code>{start_mmss}</code>.\n"
-                    "Now send the <b>end time</b> in <code>MM:SS</code> format.\n"
-                    "<i>Example: <code>05:00</code> for 5 minutes.</i>\n\n"
-                    "You can also send bare seconds, e.g. <code>300</code>.",
-                    reply_markup=build_cancel_keyboard(),
-                    parse_mode=ParseMode.HTML
-                )
-                us.temp_state[user_id] = {
-                    "chat_id":            chat_id,
-                    "settings_message_id": settings_message_id,
-                    "state":              "waiting_wm_range_end",
-                    "prompt_message_id":  sent.id,
-                    "back_to":            "watermark",
-                }
-            except ValueError:
-                await message.reply_text(
-                    "Please send a valid time in <code>MM:SS</code> format "
-                    "(e.g. <code>01:30</code>) or bare seconds (e.g. <code>90</code>).",
-                    parse_mode=ParseMode.HTML
-                )
-
-        elif state == "waiting_wm_range_end":
-            try:
-                end   = _mmss_to_secs(message.text)
-                wm    = us.get_watermark()
-                start = wm.get("start", 0)
-                if end <= start:
-                    start_mmss = _secs_to_mmss(start)
-                    await message.reply_text(
-                        f"End time must be greater than start time "
-                        f"(<code>{start_mmss}</code>).",
-                        parse_mode=ParseMode.HTML
-                    )
-                    return
-                us.update_watermark(end=end)
-                del us.temp_state[user_id]
-                await _cleanup()
-                wm         = us.get_watermark()
-                start_mmss = _secs_to_mmss(wm["start"])
-                end_mmss   = _secs_to_mmss(end)
-                await _edit_settings(
-                    build_watermark_text(wm, f"Timing set: {start_mmss} → {end_mmss}"),
-                    build_watermark_keyboard(wm),
-                )
-            except ValueError:
-                await message.reply_text(
-                    "Please send a valid time in <code>MM:SS</code> format "
-                    "(e.g. <code>05:00</code>) or bare seconds (e.g. <code>300</code>).",
-                    parse_mode=ParseMode.HTML
-                )
-
-        elif state == "waiting_wm_duration":
-            try:
-                duration = int(message.text.strip())
-                if not (1 <= duration <= 3600):
-                    raise ValueError
-                us.update_watermark(duration=duration)
-                del us.temp_state[user_id]
-                await _cleanup()
-                wm = us.get_watermark()
-                await _edit_settings(
-                    "<b>Random Duration</b>\n\n"
-                    "The watermark will appear at random non-overlapping points in the video.\n\n"
-                    f"<b>Appearances:</b> <code>{wm.get('repeat_count', 1)}×</code>  "
-                    "— how many times it should appear.\n"
-                    f"<b>Duration each:</b> <code>{wm.get('duration', 30)}s</code>  "
-                    "— how many seconds each appearance lasts.\n\n"
-                    "<i>The video is divided into equal sections; one appearance is placed "
-                    "randomly inside each section so they never overlap.</i>\n\n"
-                    f"<i>Duration per appearance set to {duration}s</i>",
-                    build_wm_random_keyboard(wm),
-                )
-            except ValueError:
-                await message.reply_text(
-                    "Please send a whole number of seconds between <code>1</code> and <code>3600</code>.",
-                    parse_mode=ParseMode.HTML
-                )
-
-        elif state == "waiting_wm_random_count":
-            try:
-                count = int(message.text.strip())
-                if not (1 <= count <= 20):
-                    raise ValueError
-                us.update_watermark(repeat_count=count)
-                del us.temp_state[user_id]
-                await _cleanup()
-                wm = us.get_watermark()
-                await _edit_settings(
-                    "<b>Random Duration</b>\n\n"
-                    "The watermark will appear at random non-overlapping points in the video.\n\n"
-                    f"<b>Appearances:</b> <code>{wm.get('repeat_count', 1)}×</code>  "
-                    "— how many times it should appear.\n"
-                    f"<b>Duration each:</b> <code>{wm.get('duration', 30)}s</code>  "
-                    "— how many seconds each appearance lasts.\n\n"
-                    "<i>The video is divided into equal sections; one appearance is placed "
-                    "randomly inside each section so they never overlap.</i>\n\n"
-                    f"<i>Appearances set to {count}×</i>",
-                    build_wm_random_keyboard(wm),
-                )
-            except ValueError:
-                await message.reply_text(
-                    "Please send a whole number between <code>1</code> and <code>20</code>.",
-                    parse_mode=ParseMode.HTML
-                )
-
-        elif state == "waiting_wm_font_size":
-            try:
-                size = int(message.text)
-                if not (8 <= size <= 96):
-                    raise ValueError
-                us.update_watermark(font_size=size)
-                del us.temp_state[user_id]
-                await _cleanup()
-                wm = us.get_watermark()
-                await _edit_settings(
-                    build_watermark_text(wm, f"Font size set to {size}px"),
-                    build_watermark_keyboard(wm),
-                )
-            except ValueError:
-                await message.reply_text(
-                    "Please send a valid integer between <code>8</code> and <code>96</code>.",
-                    parse_mode=ParseMode.HTML
-                )
-
-        elif state == "waiting_wm_padding":
-            try:
-                padding = int(message.text)
-                if not (1 <= padding <= 25):
-                    raise ValueError
-                us.update_watermark(padding=padding)
-                del us.temp_state[user_id]
-                await _cleanup()
-                wm = us.get_watermark()
-                await _edit_settings(
-                    build_watermark_text(wm, f"Padding set to {padding}%"),
-                    build_watermark_keyboard(wm),
-                )
-            except ValueError:
-                await message.reply_text(
-                    "Please send a whole number between <code>1</code> and <code>25</code>.",
-                    parse_mode=ParseMode.HTML
-                )
-
         elif state == "waiting_start_episode":
             raw = message.text.strip()
             if not raw.isdigit() or int(raw) < 1:
@@ -1421,7 +842,14 @@ def setup_settings_handlers(
             us.set_thumbnail(os.path.abspath(downloaded_path))
             del us.temp_state[user_id]
 
-            ids = [i for i in [prompt_message_id, message.id] if i]
+            # `thumb_upload` builds the "Send an image..." prompt by editing
+            # the settings menu message in place, so prompt_message_id and
+            # settings_message_id are the SAME message. Only delete the
+            # user's uploaded photo here - deleting the settings message
+            # would leave settings_message_id pointing at nothing, and the
+            # get_messages() call below would then hand back an empty
+            # (chat=None) Message instead of raising.
+            ids = [i for i in [prompt_message_id, message.id] if i and i != settings_message_id]
             if ids:
                 try:
                     await client.delete_messages(chat_id=chat_id, message_ids=ids)
@@ -1432,6 +860,8 @@ def setup_settings_handlers(
             if settings_message_id:
                 try:
                     settings_message = await client.get_messages(chat_id, settings_message_id)
+                    if settings_message is not None and getattr(settings_message, "empty", False):
+                        settings_message = None
                 except Exception:
                     settings_message = None
 
@@ -1447,93 +877,7 @@ def setup_settings_handlers(
                 chat_id=chat_id, photo=thumbnail_path or SETTINGS_IMAGE_URL,
                 caption=result_text, reply_markup=result_keyboard, parse_mode=ParseMode.HTML,
             )
-            _settings_owner[(chat_id, sent.id)] = user_id
+            _set_settings_owner(chat_id, sent.id, user_id)
 
         except Exception as e:
             await message.reply_text(f"<b>Error saving thumbnail:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)
-
-    @app.on_message(filters.document & (chat_scope_filter(config)))
-    async def handle_font_upload(client: Client, message: Message):
-        user_id    = message.from_user.id
-        us         = user_settings(user_id)
-        if user_id not in us.temp_state:
-            return
-
-        state_data = us.temp_state[user_id]
-        if not (isinstance(state_data, dict) and state_data.get("state") == "waiting_wm_font"):
-            return
-
-        prompt_message_id   = state_data.get("prompt_message_id")
-        chat_id             = state_data.get("chat_id", user_id)
-        settings_message_id = state_data.get("settings_message_id")
-
-        if message.chat.id != chat_id:
-            return
-        doc = message.document
-
-        if not doc:
-            return
-
-        file_name = doc.file_name or ""
-        ext       = os.path.splitext(file_name)[1].lower()
-
-        if ext not in (".ttf", ".otf"):
-            await message.reply_text(
-                "Only <code>.ttf</code> and <code>.otf</code> font files are accepted.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        try:
-            fonts_dir  = config.paths.fonts
-            os.makedirs(fonts_dir, exist_ok=True)
-            tmp_path   = os.path.join(fonts_dir, f".upload_{user_id}_{os.urandom(8).hex()}{ext}")
-            downloaded = await client.download_media(message, file_name=tmp_path)
-
-            if not downloaded or not os.path.exists(downloaded):
-                await message.reply_text(
-                    "<b>▸ Download Failed</b>\n"
-                    "────────────────\n"
-                    "<i>Could not download the font file. Please try again.</i>",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-
-            font_name = us.set_watermark_font(os.path.abspath(downloaded))
-
-            if os.path.exists(downloaded) and downloaded == tmp_path:
-                try:
-                    os.remove(downloaded)
-                except Exception:
-                    pass
-
-            del us.temp_state[user_id]
-
-            ids = [i for i in [prompt_message_id, message.id] if i]
-            if ids:
-                try:
-                    await client.delete_messages(chat_id=chat_id, message_ids=ids)
-                except Exception:
-                    pass
-
-            wm              = us.get_watermark()
-            result_text     = build_watermark_text(wm, f"Font set to <b>{font_name}</b>")
-            result_keyboard = build_watermark_keyboard(wm)
-            if settings_message_id:
-                try:
-                    await client.edit_message_text(
-                        chat_id=chat_id, message_id=settings_message_id,
-                        text=result_text, reply_markup=result_keyboard,
-                        parse_mode=ParseMode.HTML,
-                    )
-                    return
-                except Exception:
-                    pass
-            sent = await client.send_message(
-                chat_id=chat_id, text=result_text,
-                reply_markup=result_keyboard, parse_mode=ParseMode.HTML,
-            )
-            _settings_owner[(chat_id, sent.id)] = user_id
-
-        except Exception as e:
-            await message.reply_text(f"<b>Error saving font:</b> <code>{e}</code>", parse_mode=ParseMode.HTML)

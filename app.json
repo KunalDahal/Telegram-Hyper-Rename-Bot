@@ -83,11 +83,6 @@
       "description": "Maximum number of uploads running concurrently.",
       "value": "1",
       "required": false
-    },
-    "WM_LIMIT": {
-      "description": "Maximum number of watermark processing jobs running concurrently.",
-      "value": "1",
-      "required": false
     }
   },
   "stack": "container"

@@ -38,6 +38,7 @@ from src.utils.moderation import setup_moderation_handlers
 from src.handlers.mi import setup_mediainfo_handlers
 from src.utils.session_persistence import ensure_persistent_session
 from src.utils.output_style import apply_global_styling
+from src.utils.startup_notify import notify_startup
 
 apply_global_styling()
 
@@ -234,6 +235,13 @@ async def main():
     ║  @{me.username:<31}║
     ╚══════════════════════════════════╝
     """
+        )
+
+        # Fire-and-forget: never let a slow/failed broadcast delay startup
+        # or take the bot down.
+        asyncio.create_task(
+            notify_startup(app, access_control, me),
+            name="startup-restart-notice",
         )
 
         try:

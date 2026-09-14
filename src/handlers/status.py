@@ -332,10 +332,7 @@ def _build_task_block(queue_pos: int, task: dict, config) -> str:
     b  = f"<b>▸ {title}</b>\n"
     b += f"┃ File : <code>{escape(str(filename))}</code>\n"
     b += f"┃ Size : <code>{size_str}</code>\n"
-    if task.get("task_type") == "rename":
-        watermark_on = bool((task.get("watermark") or {}).get("enabled"))
-        b += f"┠ Watermark : <b>{'On' if watermark_on else 'Off'}</b>\n"
-    else:
+    if task.get("task_type") != "rename":
         b += f"┠ Resolution : {res_line}\n"
     b += f"┠ Status : <i>{status_label}</i>\n"
 
@@ -399,7 +396,7 @@ def _build_status_label(task: dict) -> str:
         "waiting_for_download": "Waiting for download slot",
         "downloading": "Downloading",
         "waiting_for_processing": "Waiting for processing slot",
-        "processing":  "Applying Metadata/Watermark",
+        "processing":  "Applying Metadata",
         "waiting_for_upload": "Waiting for upload slot",
     }
     if status in labels:

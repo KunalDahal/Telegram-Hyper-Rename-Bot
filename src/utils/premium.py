@@ -22,7 +22,6 @@ DEVELOPER_URL = "https://t.me/NyxyRen"
 
 PREMIUM_FEATURES = [
     "Rename unlimited files",
-    "Watermark",
     "Metadata",
     "Batch rename",
     "Media info",
