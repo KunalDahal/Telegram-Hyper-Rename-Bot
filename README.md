@@ -233,18 +233,34 @@ The compose configuration persists `src/bin` for local logs and active work
 files. MongoDB stores Premium/banned users, user settings, thumbnails,
 and task records.
 
-## Heroku deployment
+## Easy Deployment with Google Colab onto Heroku
 
-Open [deploy_heroku.ipynb](deploy_heroku.ipynb) in Google Colab or a compatible
-Jupyter environment. It provides an interactive control center to:
+Don't want to deploy manually on heroku? Use the included `deploy_heroku.ipynb` notebook to deploy the bot easily through **Google Colab**.
 
-1. Connect your Heroku account using an API key.
-2. Create one or more container-stack apps.
-3. Add the bot configuration as Heroku config vars through masked form inputs.
-4. Deploy this repository and stream application logs.
+### Quick Setup
 
-Push your current code to GitHub before deploying—the notebook clones the
-repository and branch you select (default: `master`).
+1. **Upload the notebook to Google Colab**
+
+   * Upload `deploy_heroku.ipynb` to [Google Colab](https://colab.research.google.com/).
+
+2. **Enter your details**
+
+   * Fill in your Heroku credentials/API key.
+   * Enter your bot token, API ID, API hash, MongoDB URI, owner ID, group ID, and other required settings.
+   * Optional settings such as Premium sessions, support bot tokens, DC filters, and workers can also be configured.
+
+3. **Run the cells one by one**
+
+   * Start from the first cell and execute each cell from top to bottom.
+   * The notebook will create the Heroku app, configure the required environment variables, deploy the repository, and start the bot.
+
+4. **Check the logs**
+
+   * Use the final **Show Live Logs** cell to monitor the bot and verify that it started correctly.
+
+> **Important:** Never share or publish the notebook after entering your credentials, API keys, bot tokens, or session strings.
+>
+> For multiple bots, use a different `BOT_TOKEN` and `MONGO_DB_NAME` for each Heroku app.
 
 ### Multiple bots and dynos
 
