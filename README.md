@@ -12,7 +12,7 @@ and ordered batch processing.
 
 - Rename individual video files and supported video documents.
 - Rename a Telegram media album or a sequence of up to 150 messages.
-- Build batch names with `{season}` and `{episode}`, including zero-padded
+- Build batch names with `{episode}`, including zero-padded
   episode numbers.
 - Save per-user settings and thumbnails in MongoDB.
 - Add title, author, artist, encoder, and other metadata without unnecessary
@@ -115,16 +115,16 @@ Reply to a video in an allowed group:
 Reply to the first file in an album:
 
 ```text
-/rename -b [S{season}-E{episode}] Show Name.mkv
+/rename -b [S1-E{episode}] Show Name.mkv
 ```
 
 Reply to the first of six sequential messages:
 
 ```text
-/rename -b 6 [S{season}-E{episode}] Show Name.mkv
+/rename -b 6 [S1-E{episode}] Show Name.mkv
 ```
 
-Only `{season}` and `{episode}` are supported in batch templates. Set the
+Only `1` and `{episode}` are supported in batch templates. Set the
 starting episode with `/ss`; season and other preferences are available in the
 settings panel.
 
