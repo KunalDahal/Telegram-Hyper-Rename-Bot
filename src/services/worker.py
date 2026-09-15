@@ -982,6 +982,8 @@ class Worker:
         task["dump_used_premium"] = use_premium_dump
         self.task_queue.checkpoint(task_id)
 
+        await self._send_completion_to_group(task, job, file_path)
+
     def _spawn_delivery(self, task: dict) -> None:
         task_id = task["task_id"]
         self.task_queue.update_status(task_id, "forwarding", 0)

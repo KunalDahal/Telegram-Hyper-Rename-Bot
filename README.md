@@ -28,6 +28,16 @@ and ordered batch processing.
 `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.mpeg`, `.mpg`, `.wmv`, `.flv`, and
 `.3gp`.
 
+## Multi-DC Support Bots
+
+For better download performance, configure support bots across multiple Telegram Data Centers (DCs) based on where most of your files are located.
+
+For example, if your files are mainly coming from **DC5**, consider running more support bots connected to DC5. If your workload is distributed across **DC1, DC4, and DC5**, keep bots from each of those DCs so files can be handled efficiently.
+
+There is no fixed limit on the number of support bots. As a practical starting point, **5–6 support bots** is generally a good setup. You can increase or decrease the number based on your file distribution and workload.
+
+**Recommendation:** Keep support bots across the DCs you actually receive files from, and allocate more bots to the DCs handling the highest volume of files.
+
 ## Commands
 
 Commands use the numeric `COMMAND_POSTFIX` configured for the bot. With the
